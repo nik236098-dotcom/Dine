@@ -34,24 +34,51 @@ class GosuslugiBrowserClient:
         self.page = None
         self.logged_in = False
 
+    async def _launch_browser(self):
+        """Поднимает постоянный (persisted) браузерный профиль, если он ещё не запущен.
+        Профиль в USER_PROFILE_DIR хранит куки между перезапусками бота, поэтому
+        повторный запуск может унаследовать уже действующую сессию Госуслуг."""
+        if self.page:
+            return
+        self.playwright = await async_playwright().start()
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            user_data_dir=USER_PROFILE_DIR, headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--blink-settings=imagesEnabled=true",
+                "--ignore-certificate-errors"
+            ],
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            locale="ru-RU", timezone_id="Europe/Moscow"
+        )
+        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        self.page.set_default_timeout(40000)
+
+    async def ensure_logged_in(self):
+        """Проверяет, действует ли уже сохранённая сессия Госуслуг, не запрашивая
+        логин/пароль заново. Используется в /pay, чтобы не гонять пользователя
+        через /login при каждом перезапуске бота, если сессия ещё жива."""
+        try:
+            await self._launch_browser()
+            await self.page.goto("https://gosuslugi.ru", wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+
+            if "login" not in self.page.url and await self.page.locator("input#login").count() == 0:
+                self.logged_in = True
+                return "already_logged_in", "✨ Сессия активна! Можно проверять штраф."
+
+            self.logged_in = False
+            return False, "❌ Сохранённая сессия не найдена или истекла."
+        except Exception as e:
+            await self.close()
+            return False, f"Ошибка проверки сессии: {str(e)}"
+
     async def start_auth(self, username, password):
         try:
-            self.playwright = await async_playwright().start()
-            self.context = await self.playwright.chromium.launch_persistent_context(
-                user_data_dir=USER_PROFILE_DIR, headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--blink-settings=imagesEnabled=true",
-                    "--ignore-certificate-errors"
-                ],
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                locale="ru-RU", timezone_id="Europe/Moscow"
-            )
-            self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-            await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            self.page.set_default_timeout(40000)
+            await self._launch_browser()
 
             await self.page.goto("https://gosuslugi.ru", wait_until="domcontentloaded")
             await asyncio.sleep(2)
@@ -85,9 +112,42 @@ class GosuslugiBrowserClient:
             await self.page.wait_for_selector("input[type='tel']", timeout=15000)
             await self.page.fill("input[type='tel']", code)
 
-            await self.page.wait_for_url("https://*.gosuslugi.ru/**", timeout=30000)
-            await self.page.wait_for_load_state("domcontentloaded")
+            # СТАРЫЙ БАГ: страница входа сама находится на *.gosuslugi.ru
+            # (обычно esia.gosuslugi.ru), поэтому wait_for_url с таким широким
+            # паттерном совпадал с текущим URL почти сразу и НИЧЕГО не проверял —
+            # бот считал вход успешным даже при заведомо неверном коде/пароле.
             await asyncio.sleep(3)
+
+            error_selector = (
+                "*:has-text('Неверный код'), *:has-text('неверный код'), "
+                "*:has-text('Код неверен'), *:has-text('истёк'), *:has-text('истек'), "
+                "*:has-text('Неверный пароль'), *:has-text('неверный логин')"
+            )
+            if await self.page.locator(error_selector).count() > 0:
+                self.logged_in = False
+                return False, "❌ Госуслуги отклонили код или данные входа. Проверьте их и попробуйте /login заново."
+
+            try:
+                await self.page.wait_for_function(
+                    "() => !location.href.includes('esia') && !location.href.includes('login')",
+                    timeout=20000
+                )
+            except PlaywrightTimeoutError:
+                pass
+
+            await self.page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(2)
+
+            # Настоящая проверка успеха: мы реально ушли со страницы входа,
+            # и на странице не осталось полей логина/пароля/смс-кода.
+            still_on_login = (
+                "esia" in self.page.url or "login" in self.page.url
+                or await self.page.locator("input[type='tel'], input#login, input#password").count() > 0
+            )
+            if still_on_login:
+                self.logged_in = False
+                return False, ("❌ Авторизация не завершена — сайт всё ещё показывает форму входа. "
+                                "Проверьте логин/пароль/код и попробуйте /login заново.")
 
             self.logged_in = True
             return True, "✅ Авторизация успешна! Введите /pay для проверки УИН."
@@ -290,6 +350,11 @@ class GosuslugiBrowserClient:
         self.logged_in = False
         if self.context: await self.context.close()
         if self.playwright: await self.playwright.stop()
+        # Иначе _launch_browser() решит, что браузер всё ещё поднят
+        # (self.page будет ссылаться на уже закрытую страницу), и не запустит его заново.
+        self.page = None
+        self.context = None
+        self.playwright = None
 
 
 @dp.message(CommandStart())
@@ -311,9 +376,21 @@ async def login_cmd(message: Message):
 async def pay_cmd(message: Message):
     chat_id = message.chat.id
     client = user_data.get(chat_id, {}).get("client")
-    if not client or not client.logged_in:
-        await message.answer("❌ Сначала необходимо войти в систему. Используйте команду /login")
-        return
+
+    if not client:
+        # После перезапуска бота клиента в памяти нет, но браузерный профиль
+        # на диске (USER_PROFILE_DIR) мог сохранить рабочую сессию Госуслуг —
+        # проверяем её, вместо того чтобы сразу гнать пользователя на /login.
+        client = GosuslugiBrowserClient()
+        user_data[chat_id] = {"client": client}
+
+    if not client.logged_in:
+        await message.answer("⏳ Проверяю сохранённую сессию Госуслуг...")
+        status, res_msg = await client.ensure_logged_in()
+        if status != "already_logged_in":
+            await message.answer(res_msg + "\n\nИспользуйте команду /login")
+            return
+
     user_state[chat_id] = "waiting_uin"
     await message.answer("Пожалуйста, введите УИН штрафа (20 или 25 цифр):")
 
