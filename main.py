@@ -288,13 +288,15 @@ class GosuslugiBrowserClient:
             current_url = self.page.url if self.page else "?"
             return False, f"Ошибка поиска: {str(e)} (страница: {current_url})"
 
-    async def _wait_for_gazprombank(self, target, card_selector, card_num, max_attempts=10):
+    async def _wait_for_gazprombank(self, target, card_selector, card_num, send_fn=None, max_attempts=60):
         """Госуслуги выбирают банк-эквайер для платежа заново при каждом новом
         вводе номера карты; какой банк выбран — видно после клика по ссылке
         'Без комиссии банка'. Газпромбанк проводит этот платёж без комиссии,
-        остальные — нет. Если банк не тот, стираем номер карты и вводим его
-        заново (с паузой, не быстро), пока не выпадет Газпромбанк или не
-        кончатся попытки. Возвращает True, если Газпромбанк подтверждён."""
+        остальные — нет. Банк выпадает случайно — иногда с первого раза,
+        иногда нет, поэтому лимит попыток большой (по ~3 сек на попытку,
+        60 попыток — это до ~3 минут). Если банк не тот, стираем номер карты
+        и вводим его заново, пока не выпадет Газпромбанк или не кончатся
+        попытки. Возвращает True, если Газпромбанк подтверждён."""
         bank_link_selector = (
             "a:has-text('Без комиссии банка'), button:has-text('Без комиссии банка'), "
             "*:has-text('Без комиссии банка')"
@@ -323,6 +325,14 @@ class GosuslugiBrowserClient:
                 attempt, max_attempts
             )
 
+            # Раз в 10 попыток даём знать в Telegram, что бот ещё работает,
+            # а не завис — угадывание банка может занять и минуту, и три.
+            if send_fn and attempt % 10 == 0:
+                try:
+                    await send_fn(f"🔄 Всё ещё подбираю Газпромбанк (попытка {attempt}/{max_attempts})...")
+                except Exception:
+                    pass
+
             if attempt < max_attempts:
                 try:
                     card_input = target.locator(card_selector).first
@@ -337,7 +347,7 @@ class GosuslugiBrowserClient:
         logger.warning("Газпромбанк не подтвердился за %d попыток — продолжаю с текущим банком.", max_attempts)
         return False
 
-    async def _submit_single_card(self, card_num, expiry, cvv):
+    async def _submit_single_card(self, card_num, expiry, cvv, send_fn=None):
         """Заполняет форму оплаты одной картой и возвращает (статус, сообщение).
         Статус — одно из: 'success', 'declined', '3ds', 'unknown', 'error'.
         Используется как внутренний шаг pay_with_cards() при переборе карт."""
@@ -394,7 +404,7 @@ class GosuslugiBrowserClient:
 
             await target.fill(card_selector, card_num)
 
-            got_gazprombank = await self._wait_for_gazprombank(target, card_selector, card_num)
+            got_gazprombank = await self._wait_for_gazprombank(target, card_selector, card_num, send_fn=send_fn)
             bank_note = "" if got_gazprombank else " ⚠️ Газпромбанк не подтвердился — возможна комиссия."
 
             await target.fill(expiry_selector, expiry)
@@ -525,7 +535,7 @@ class GosuslugiBrowserClient:
                     await send_fn(f"⚠️ Не удалось перезагрузить страницу оплаты перед картой {masked}: {e}")
 
             await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): пробую оплатить...")
-            status, message = await self._submit_single_card(card_num, expiry, cvv)
+            status, message = await self._submit_single_card(card_num, expiry, cvv, send_fn=send_fn)
             await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): {message}")
 
             if status == "success":
