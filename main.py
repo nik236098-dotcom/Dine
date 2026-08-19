@@ -305,6 +305,10 @@ class GosuslugiBrowserClient:
             "u:text-is('банка'), *:text-is('банка'), "
             "a:has-text('Без комиссии банка'), button:has-text('Без комиссии банка')"
         )
+        # ".has-text" матчит ВСЕХ предков, где угодно в поддереве которых есть
+        # фраза — от всей модалки до самого заголовка внутри неё. Нужен именно
+        # самый ВНЕШНИЙ контейнер (там же лежит и текст "Перевод пройдёт
+        # через..."), а не самый глубокий — поэтому .first, а не .last.
         modal_selector = "*:has-text('Информация о платеже')"
         close_button_selector = "button:has-text('Закрыть'), button:text-is('Закрыть')"
         target_bank_names = ("газпромбанк", "гпб", "gazprombank")
@@ -312,27 +316,30 @@ class GosuslugiBrowserClient:
         for attempt in range(1, max_attempts + 1):
             await asyncio.sleep(2)  # не быстро — как раз то время, чтобы сайт показал банк
 
-            # ВАЖНО: раньше проверялся весь текст страницы (и даже все картинки) —
-            # где-то на странице статично упоминается "Газпромбанк" (например,
-            # в списке поддерживаемых банков), поэтому проверка срабатывала
-            # всегда, независимо от реально выбранного банка. Теперь смотрим
-            # ТОЛЬКО текст внутри самой модалки с результатом.
             modal_text = ""
             try:
                 bank_link = target.locator(bank_link_selector).first
                 if await bank_link.count() > 0:
                     await bank_link.click()
                     await asyncio.sleep(1)
-                    modal = target.locator(modal_selector).last
+                    modal = target.locator(modal_selector).first
                     if await modal.count() > 0:
                         modal_text = (await modal.inner_text()).lower()
             except Exception as e:
                 logger.warning("Не удалось прочитать банк-эквайер (попытка %d): %s", attempt, e)
 
-            if attempt <= 3:
-                logger.info("Банк, попытка %d — текст модалки: %s", attempt, modal_text[:300])
+            # Название банка ищем именно рядом с фразой "Перевод пройдёт через" —
+            # так не словим случайное упоминание банка где-то ещё в модалке.
+            bank_match = re.search(r"перевод пройдёт через[^«]*«([^»]+)»", modal_text)
+            detected_bank = bank_match.group(1) if bank_match else None
 
-            matched = any(name in modal_text for name in target_bank_names)
+            if attempt <= 5 or detected_bank:
+                logger.info(
+                    "Банк, попытка %d — распознано: %s | текст модалки: %s",
+                    attempt, detected_bank, modal_text[:300]
+                )
+
+            matched = detected_bank is not None and any(name in detected_bank for name in target_bank_names)
 
             # Модалку обязательно закрываем в любом случае — иначе она
             # перекрывает поле карты и следующая попытка ничего не сможет ввести.
