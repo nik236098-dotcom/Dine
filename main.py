@@ -130,6 +130,14 @@ class GosuslugiBrowserClient:
             button = self.page.locator("button[type='submit'], button:has-text('Найти'), button:has-text('Проверить')").first
             await button.click()
 
+            # Снимок сразу после клика — чтобы видеть, что произошло на странице,
+            # даже если поиск в итоге зависнет и упадёт по таймауту ниже.
+            try:
+                await asyncio.sleep(1)
+                await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "after_search_click.png"))
+            except Exception:
+                pass
+
             # Даём странице время подгрузить результат поиска (это AJAX/React,
             # а не обычная навигация) прежде чем искать сумму.
             try:
