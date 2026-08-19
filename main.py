@@ -155,54 +155,57 @@ class GosuslugiBrowserClient:
             await self.close()
             return False, f"Ошибка при вводе СМС: {str(e)}"
 
-    async def check_penalty_by_uin(self, uin):
+    async def check_penalty_by_uin(self, uin, page):
+        """Ищет штраф по УИН на переданной странице (page). Страница передаётся
+        явно, а не берётся из self.page, чтобы можно было запускать несколько
+        таких проверок параллельно на разных вкладках одного браузера."""
         try:
-            if not self.page or not self.logged_in:
-                return False, "Вы не авторизованы. Введите /login."
+            if not page or not self.logged_in:
+                return False, "Вы не авторизованы. Введите /login.", page
 
             # БАГ БЫЛ ЗДЕСЬ: раньше переход выполнялся на "https://gosuslugi.ru" (главная),
             # а не на страницу поиска квитанций — на главной нет поля ввода УИН,
             # поэтому wait_for_selector ниже всегда падал по таймауту.
             logger.info("Выполняю переход на %s", QUITTANCE_URL)
-            await self.page.goto(QUITTANCE_URL, wait_until="load")
+            await page.goto(QUITTANCE_URL, wait_until="load")
 
             # Если сессия истекла или сайт заподозрил автоматизацию — нас могут
             # редиректнуть обратно на страницу логина. Проверяем это явно,
             # вместо того чтобы падать в неясный Timeout.
             await asyncio.sleep(2)
-            if "login" in self.page.url or "esia" in self.page.url:
+            if "login" in page.url or "esia" in page.url:
                 self.logged_in = False
-                return False, "⚠️ Сессия слетела — сайт вернул вас на страницу входа. Авторизуйтесь заново через /login."
+                return False, "⚠️ Сессия слетела — сайт вернул вас на страницу входа. Авторизуйтесь заново через /login.", page
 
             uin_selector = (
                 "input[name*='uin' i], input[id*='uin' i], "
                 "input[placeholder*='УИН'], input[placeholder*='уин'], "
                 "input[type='text']"
             )
-            await self.page.wait_for_selector(uin_selector, state="visible", timeout=25000)
-            uin_input = self.page.locator(uin_selector).first
+            await page.wait_for_selector(uin_selector, state="visible", timeout=25000)
+            uin_input = page.locator(uin_selector).first
 
             await uin_input.click()
-            await self.page.keyboard.press("Control+A")
-            await self.page.keyboard.press("Delete")
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Delete")
             await uin_input.fill(uin)
             await asyncio.sleep(1)
 
-            button = self.page.locator("button[type='submit'], button:has-text('Найти'), button:has-text('Проверить')").first
+            button = page.locator("button[type='submit'], button:has-text('Найти'), button:has-text('Проверить')").first
             await button.click()
 
             # Снимок сразу после клика — чтобы видеть, что произошло на странице,
             # даже если поиск в итоге зависнет и упадёт по таймауту ниже.
             try:
                 await asyncio.sleep(1)
-                await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "after_search_click.png"))
+                await page.screenshot(path=os.path.join(BASE_DATA_DIR, "after_search_click.png"))
             except Exception:
                 pass
 
             # Даём странице время подгрузить результат поиска (это AJAX/React,
             # а не обычная навигация) прежде чем искать сумму.
             try:
-                await self.page.wait_for_load_state("networkidle", timeout=8000)
+                await page.wait_for_load_state("networkidle", timeout=8000)
             except PlaywrightTimeoutError:
                 pass
             await asyncio.sleep(2)
@@ -220,10 +223,10 @@ class GosuslugiBrowserClient:
                 "*:has-text('ничего не найдено'), *:has-text('отсутствует')"
             )
 
-            logger.info("Всего фреймов на странице: %d", len(self.page.frames))
+            logger.info("Всего фреймов на странице: %d", len(page.frames))
 
             found = False
-            for frame in self.page.frames:
+            for frame in page.frames:
                 try:
                     await frame.wait_for_selector(result_selector, state="visible", timeout=30000)
                     found = True
@@ -234,29 +237,29 @@ class GosuslugiBrowserClient:
             if not found:
                 # Точная диагностика: что реально видел Playwright в момент неудачи.
                 try:
-                    body_text = await self.page.inner_text("body")
+                    body_text = await page.inner_text("body")
                     logger.info("Длина текста body: %d символов", len(body_text))
                     logger.info("Вхождений 'Найдено' в тексте: %d", body_text.count("Найдено"))
                     logger.info("Первые 500 символов текста страницы: %s", body_text[:500])
                 except Exception as diag_err:
                     logger.warning("Не удалось прочитать текст страницы для диагностики: %s", diag_err)
 
-                if await self.page.locator(not_found_selector).count() > 0:
-                    return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно."
+                if await page.locator(not_found_selector).count() > 0:
+                    return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно.", page
                 raise PlaywrightTimeoutError("сумма штрафа не появилась ни на странице, ни во фреймах")
 
             # Достаём сумму штрафа для вывода в сообщении пользователю.
             # Внимание: символ рубля в тексте страницы — это буква "Р", не "₽".
             amount_str = None
             try:
-                body_text = await self.page.inner_text("body")
+                body_text = await page.inner_text("body")
                 amount_match = re.search(r"(\d[\d \s]*\d)\s*Р(?![а-яёА-ЯЁ])", body_text)
                 if amount_match:
                     amount_str = amount_match.group(1).replace(" ", " ").strip()
             except Exception:
                 pass
 
-            pay_button = self.page.locator("button:has-text('Оплатить'), button:has-text('Перейти к оплате')").first
+            pay_button = page.locator("button:has-text('Оплатить'), button:has-text('Перейти к оплате')").first
             await pay_button.wait_for(state="visible", timeout=15000)
 
             # На Госуслугах оплата часто открывается в НОВОЙ вкладке (popup),
@@ -267,7 +270,7 @@ class GosuslugiBrowserClient:
                     await pay_button.click()
                 new_page = await new_page_info.value
                 await new_page.wait_for_load_state("domcontentloaded")
-                self.page = new_page
+                page = new_page
                 logger.info("Оплата открылась в новой вкладке: %s", new_page.url)
             except PlaywrightTimeoutError:
                 # Новая вкладка не появилась — форма оплаты, скорее всего, на этой же странице
@@ -278,15 +281,15 @@ class GosuslugiBrowserClient:
                 f"✅ Штраф найден!{amount_line} Введите данные карты в формате: номер|дата|cvv\n"
                 "Можно несколько карт — каждую с новой строки, бот будет пробовать их по очереди, "
                 "пока платёж не пройдёт."
-            )
+            ), page
         except Exception as e:
             try:
-                if self.page:
-                    await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_check_penalty.png"))
+                if page:
+                    await page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_check_penalty.png"))
             except Exception:
                 pass
-            current_url = self.page.url if self.page else "?"
-            return False, f"Ошибка поиска: {str(e)} (страница: {current_url})"
+            current_url = page.url if page else "?"
+            return False, f"Ошибка поиска: {str(e)} (страница: {current_url})", page
 
     async def _wait_for_gazprombank(self, target, card_selector, card_num, send_fn=None, max_attempts=60):
         """Госуслуги выбирают банк-эквайер для платежа заново при каждом новом
@@ -382,12 +385,12 @@ class GosuslugiBrowserClient:
         logger.warning("Газпромбанк не подтвердился за %d попыток — продолжаю с текущим банком.", max_attempts)
         return False
 
-    async def _submit_single_card(self, card_num, expiry, cvv, send_fn=None):
+    async def _submit_single_card(self, card_num, expiry, cvv, page, send_fn=None):
         """Заполняет форму оплаты одной картой и возвращает (статус, сообщение).
         Статус — одно из: 'success', 'declined', '3ds', 'unknown', 'error'.
         Используется как внутренний шаг pay_with_cards() при переборе карт."""
         try:
-            if not self.page: return "error", "Браузер не активен."
+            if not page: return "error", "Браузер не активен."
 
             # СТАРЫЙ БАГ: URL страницы оплаты — payment.gosuslugi.ru, поэтому
             # подстрока "pay" всегда находится в URL ГЛАВНОГО фрейма и код
@@ -401,7 +404,7 @@ class GosuslugiBrowserClient:
             )
 
             target = None
-            for frame in self.page.frames:
+            for frame in page.frames:
                 try:
                     await frame.wait_for_selector(card_selector, state="visible", timeout=8000)
                     target = frame
@@ -412,7 +415,7 @@ class GosuslugiBrowserClient:
             if target is None:
                 # Диагностика: логируем реальные атрибуты всех input на странице
                 # и во всех фреймах, чтобы не гадать с селекторами вслепую.
-                for frame in self.page.frames:
+                for frame in page.frames:
                     try:
                         inputs_info = await frame.eval_on_selector_all(
                             "input",
@@ -423,7 +426,7 @@ class GosuslugiBrowserClient:
                     except Exception as diag_err:
                         logger.warning("Не удалось прочитать input'ы фрейма %s: %s", frame.url, diag_err)
                 try:
-                    await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_pay_by_card.png"))
+                    await page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_pay_by_card.png"))
                 except Exception:
                     pass
                 return "error", "поле номера карты не найдено ни на странице, ни во фреймах (см. лог)."
@@ -446,18 +449,18 @@ class GosuslugiBrowserClient:
             await target.fill(cvv_selector, cvv)
             await target.click("button:has-text('Оплатить'), button[type='submit']")
 
-            status, message = await self._await_payment_outcome()
+            status, message = await self._await_payment_outcome(page)
             return status, message + bank_note
         except Exception as e:
             try:
-                if self.page:
-                    await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_pay_by_card.png"))
+                if page:
+                    await page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_pay_by_card.png"))
             except Exception:
                 pass
-            current_url = self.page.url if self.page else "?"
+            current_url = page.url if page else "?"
             return "error", f"Не удалось автоматически заполнить карту: {str(e)} (страница: {current_url})"
 
-    async def _await_payment_outcome(self):
+    async def _await_payment_outcome(self, page):
         """После клика 'Оплатить' смотрим, что реально ответил сайт: успех,
         отказ или запрос 3DS-подтверждения. Точные тексты угаданы (реального
         лога результата платежа ещё не было) — если ни один вариант не
@@ -500,7 +503,7 @@ class GosuslugiBrowserClient:
 
         async def confirm_cancel_if_asked():
             await asyncio.sleep(1.5)
-            for frame in self.page.frames:
+            for frame in page.frames:
                 try:
                     confirm_btn = frame.locator(confirm_cancel_selector).first
                     if await confirm_btn.count() > 0:
@@ -513,7 +516,7 @@ class GosuslugiBrowserClient:
 
         outcome = None
         for _ in range(8):  # опрашиваем ~40 секунд — банк может отвечать не сразу
-            for frame in self.page.frames:
+            for frame in page.frames:
                 try:
                     if await frame.locator(cancel_selector).count() > 0:
                         outcome = "3ds"
@@ -543,7 +546,7 @@ class GosuslugiBrowserClient:
             # Домен банка мог сработать раньше, чем страница дорисовала кнопку —
             # даём ей до 10 сек показаться, прежде чем сдаваться.
             clicked = False
-            for frame in self.page.frames:
+            for frame in page.frames:
                 try:
                     await frame.wait_for_selector(cancel_selector, state="visible", timeout=10000)
                     btn = frame.locator(cancel_selector).first
@@ -562,14 +565,14 @@ class GosuslugiBrowserClient:
             # Кнопку отмены не нашли — это ровно та ситуация, которая раньше
             # приводила к зависанию/некорректному состоянию платежа. Логируем
             # разметку страницы, чтобы точно подставить селектор кнопки.
-            for frame in self.page.frames:
+            for frame in page.frames:
                 try:
                     text = await frame.inner_text("body")
                     logger.info("3DS без кнопки отмены — фрейм %s: %s", frame.url, text[:400])
                 except Exception:
                     logger.info("3DS без кнопки отмены — фрейм %s: не удалось прочитать текст", frame.url)
             try:
-                await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "3ds_no_cancel_button.png"))
+                await page.screenshot(path=os.path.join(BASE_DATA_DIR, "3ds_no_cancel_button.png"))
             except Exception:
                 pass
             logger.warning("3DS обнаружен, но кнопку отмены найти не удалось — платёж остался незавершённым.")
@@ -579,7 +582,7 @@ class GosuslugiBrowserClient:
         # не осталась ли где-то незакрытая кнопка "Отмена" (мало ли угадали
         # не весь текст 3DS, а только её) — лучше закрыть платёж чисто, чем
         # оставить Госуслуги в подвешенном состоянии.
-        for frame in self.page.frames:
+        for frame in page.frames:
             try:
                 btn = frame.locator(cancel_selector).first
                 if await btn.count() > 0:
@@ -592,8 +595,8 @@ class GosuslugiBrowserClient:
         # Логируем реальную картину, чтобы точно подставить правильные
         # селекторы, а не гадать заново.
         try:
-            logger.info("Итог платежа не распознан. Фреймов: %d", len(self.page.frames))
-            for frame in self.page.frames:
+            logger.info("Итог платежа не распознан. Фреймов: %d", len(page.frames))
+            for frame in page.frames:
                 try:
                     text = await frame.inner_text("body")
                     logger.info("Фрейм %s — первые 400 символов: %s", frame.url, text[:400])
@@ -603,7 +606,7 @@ class GosuslugiBrowserClient:
             logger.warning("Не удалось собрать диагностику по итогу платежа: %s", diag_err)
 
         try:
-            await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "payment_outcome_unknown.png"))
+            await page.screenshot(path=os.path.join(BASE_DATA_DIR, "payment_outcome_unknown.png"))
         except Exception:
             pass
 
@@ -614,16 +617,18 @@ class GosuslugiBrowserClient:
         digits = re.sub(r"\D", "", card_num)
         return f"•••• {digits[-4:]}" if len(digits) >= 4 else "••••"
 
-    async def pay_with_cards(self, cards, send_fn):
+    async def pay_with_cards(self, cards, send_fn, page):
         """Пробует карты по очереди (номер, срок, cvv), пока платёж не пройдёт
         успешно, или карты не закончатся. После каждой попытки вызывает
         send_fn(text) с результатом именно по этой карте. Останавливается
-        сразу после первого успеха."""
-        if not self.page:
+        сразу после первого успеха. page передаётся явно — так на одной и той
+        же вкладке или на разных (для параллельной оплаты) можно вызывать
+        этот метод независимо."""
+        if not page:
             await send_fn("Браузер не активен.")
             return False
 
-        payment_url = self.page.url
+        payment_url = page.url
 
         for index, (card_num, expiry, cvv) in enumerate(cards, start=1):
             masked = self._mask_card(card_num)
@@ -633,13 +638,13 @@ class GosuslugiBrowserClient:
                 # состоянии (экран отказа, отменённый 3DS и т.п.) — перед
                 # следующей картой возвращаемся на чистую страницу оплаты.
                 try:
-                    await self.page.goto(payment_url, wait_until="load")
+                    await page.goto(payment_url, wait_until="load")
                     await asyncio.sleep(2)
                 except Exception as e:
                     await send_fn(f"⚠️ Не удалось перезагрузить страницу оплаты перед картой {masked}: {e}")
 
             await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): пробую оплатить...")
-            status, message = await self._submit_single_card(card_num, expiry, cvv, send_fn=send_fn)
+            status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
             await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): {message}")
 
             if status == "success":
@@ -694,7 +699,11 @@ async def pay_cmd(message: Message):
             return
 
     user_state[chat_id] = "waiting_uin"
-    await message.answer("Пожалуйста, введите УИН штрафа (20 или 25 цифр):")
+    await message.answer(
+        "Пожалуйста, введите УИН штрафа (20 или 25 цифр).\n"
+        "Можно сразу два УИН, каждый с новой строки — бот проверит и оплатит "
+        "их параллельно, в двух вкладках одного браузера."
+    )
 
 
 @dp.message(lambda message: message.text and not message.text.startswith("/"))
@@ -726,16 +735,48 @@ async def process_steps(message: Message):
         else:
             user_state[chat_id] = None
     elif state == "waiting_uin":
-        if not message.text.strip().isdigit() or len(message.text.strip()) not in (20, 25):
-            await message.answer("❌ Неверный формат УИН. Попробуйте еще раз:")
+        # Можно ввести один или два УИН, каждый с новой строки — второй штраф
+        # обрабатывается на отдельной вкладке того же браузера (сессия входа
+        # общая на весь контекст), параллельно с первым.
+        uins = [line.strip() for line in message.text.splitlines() if line.strip()]
+        if not uins or any(not u.isdigit() or len(u) not in (20, 25) for u in uins):
+            await message.answer(
+                "❌ Неверный формат. Каждый УИН — 20 или 25 цифр, можно одну или две строки:"
+            )
             return
-        await message.answer("⏳ Выполняю переход по прямой ссылке на страницу квитанций...")
-        success, res_msg = await client.check_penalty_by_uin(message.text.strip())
-        await message.answer(res_msg)
-        if success:
-            user_state[chat_id] = "waiting_card_info"
-        else:
+        if len(uins) > 2:
+            await message.answer("❌ Пока можно проверить не больше 2 штрафов одновременно.")
+            return
+
+        await message.answer(f"⏳ Проверяю {len(uins)} штраф(ов){' параллельно' if len(uins) > 1 else ''}...")
+
+        # Первый УИН — на уже открытой вкладке клиента, для второго открываем
+        # новую вкладку в том же контексте (куки/сессия входа общие).
+        pages = [client.page]
+        for _ in range(len(uins) - 1):
+            new_tab = await client.context.new_page()
+            await new_tab.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            new_tab.set_default_timeout(40000)
+            pages.append(new_tab)
+
+        async def check_one(index, uin, page):
+            success, res_msg, result_page = await client.check_penalty_by_uin(uin, page)
+            prefix = f"Штраф {index}/{len(uins)} (УИН {uin}): " if len(uins) > 1 else ""
+            await message.answer(f"{prefix}{res_msg}")
+            return success, result_page, uin
+
+        results = await asyncio.gather(*[
+            check_one(i + 1, uin, pages[i]) for i, uin in enumerate(uins)
+        ])
+
+        found_fines = [(page, uin) for success, page, uin in results if success]
+
+        if not found_fines:
             user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
+            return
+
+        user_data[chat_id]["pending_fines"] = found_fines
+        user_state[chat_id] = "waiting_card_info"
     elif state == "waiting_card_info":
         # Можно ввести несколько карт — каждую с новой строки в формате номер|дата|cvv.
         # Бот пробует их по очереди и останавливается на первой успешной оплате.
@@ -755,12 +796,29 @@ async def process_steps(message: Message):
             await message.answer("❌ Не нашёл ни одной карты. Введите: номер|дата|cvv")
             return
 
-        await message.answer(f"⏳ Начинаю оплату, карт в очереди: {len(cards)}...")
+        pending_fines = user_data[chat_id].get("pending_fines") or [(client.page, None)]
+        multi = len(pending_fines) > 1
 
-        async def send(text):
-            await message.answer(text)
+        await message.answer(
+            f"⏳ Начинаю оплату{' на ' + str(len(pending_fines)) + ' вкладках параллельно' if multi else ''}, "
+            f"карт в очереди: {len(cards)}..."
+        )
 
-        await client.pay_with_cards(cards, send)
+        async def pay_one(index, page, uin):
+            prefix = ""
+            if multi:
+                prefix = f"Штраф {index}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "") + ": "
+
+            async def send(text):
+                await message.answer(f"{prefix}{text}")
+
+            await client.pay_with_cards(cards, send, page)
+
+        await asyncio.gather(*[
+            pay_one(i + 1, page, uin) for i, (page, uin) in enumerate(pending_fines)
+        ])
+
+        user_data[chat_id].pop("pending_fines", None)
         user_state[chat_id] = "ready_for_pay"
 
 
