@@ -9,12 +9,7 @@ from playwright.async_api import async_playwright
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен читаем из переменной окружения — не храните его в коде.
-# Если он уже когда-то был закоммичен/показан в открытом виде, обязательно
-# перевыпустите его через @BotFather (/revoke), старый нужно считать скомпрометированным.
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Задайте переменную окружения TELEGRAM_BOT_TOKEN перед запуском бота")
+TELEGRAM_BOT_TOKEN = "8839226959:AAEnAfN1Hs3OOqmCPui0sSaz6MjCNsrR6Rc"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
