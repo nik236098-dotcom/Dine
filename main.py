@@ -4,7 +4,7 @@ import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -131,12 +131,33 @@ class GosuslugiBrowserClient:
             await button.click()
 
             await self.page.wait_for_selector(".amount, .price, *:has-text('₽')", timeout=15000)
-            await self.page.click("button:has-text('Оплатить'), button:has-text('Перейти к оплате')")
-            await asyncio.sleep(4)
+
+            pay_button = self.page.locator("button:has-text('Оплатить'), button:has-text('Перейти к оплате')").first
+            await pay_button.wait_for(state="visible", timeout=15000)
+
+            # На Госуслугах оплата часто открывается в НОВОЙ вкладке (popup),
+            # а не на текущей странице. Если это так — переключаемся на неё,
+            # иначе следующий шаг (ввод карты) будет искать поля не там.
+            try:
+                async with self.context.expect_page(timeout=6000) as new_page_info:
+                    await pay_button.click()
+                new_page = await new_page_info.value
+                await new_page.wait_for_load_state("domcontentloaded")
+                self.page = new_page
+                logger.info("Оплата открылась в новой вкладке: %s", new_page.url)
+            except PlaywrightTimeoutError:
+                # Новая вкладка не появилась — форма оплаты, скорее всего, на этой же странице
+                await asyncio.sleep(4)
 
             return True, "✅ Штраф найден! Введите данные карты в формате: номер|дата|cvv"
         except Exception as e:
-            return False, f"Ошибка поиска: {str(e)}"
+            try:
+                if self.page:
+                    await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_check_penalty.png"))
+            except Exception:
+                pass
+            current_url = self.page.url if self.page else "?"
+            return False, f"Ошибка поиска: {str(e)} (страница: {current_url})"
 
     async def pay_by_card_auto(self, card_num, expiry, cvv):
         try:
@@ -154,7 +175,13 @@ class GosuslugiBrowserClient:
             await target.click("button:has-text('Оплатить'), button[type='submit']")
             return True, "⏳ Данные карты успешно введены! Завершите платеж по СМС в окне на вашем ПК."
         except Exception as e:
-            return False, f"Не удалось автоматически заполнить карту: {str(e)}"
+            try:
+                if self.page:
+                    await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_pay_by_card.png"))
+            except Exception:
+                pass
+            current_url = self.page.url if self.page else "?"
+            return False, f"Не удалось автоматически заполнить карту: {str(e)} (страница: {current_url})"
 
     async def close(self):
         self.logged_in = False
