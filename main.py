@@ -17,6 +17,7 @@ dp = Dispatcher()
 
 user_state = {}
 user_data = {}
+active_tasks = {}  # chat_id -> asyncio.Task текущего process_steps, чтобы /stop мог его отменить
 
 BASE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_data")
 os.makedirs(BASE_DATA_DIR, exist_ok=True)
@@ -657,7 +658,7 @@ class GosuslugiBrowserClient:
         page передаётся явно, чтобы разные вызовы работали на разных вкладках."""
         SHORT_STATUS = {
             "success": "✅",
-            "processing": "⏳ в обработке",
+            "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
             "declined": "❌",
             "3ds": "🚫 3DS",
             "unknown": "❓",
@@ -702,8 +703,20 @@ class GosuslugiBrowserClient:
 
     async def close(self):
         self.logged_in = False
-        if self.context: await self.context.close()
-        if self.playwright: await self.playwright.stop()
+        # try/except на каждый шаг: /stop может вызвать close() ровно в момент,
+        # когда где-то ещё идёт операция с этим же context/page — тогда Playwright
+        # кинет ошибку о закрытом соединении. Это ожидаемо и не должно мешать
+        # /stop гарантированно завершиться и освободить браузер.
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception as e:
+            logger.warning("Ошибка при закрытии context (не критично): %s", e)
+        try:
+            if self.playwright:
+                await self.playwright.stop()
+        except Exception as e:
+            logger.warning("Ошибка при остановке playwright (не критично): %s", e)
         # Иначе _launch_browser() решит, что браузер всё ещё поднят
         # (self.page будет ссылаться на уже закрытую страницу), и не запустит его заново.
         self.page = None
@@ -738,7 +751,13 @@ class StatusMessage:
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    await message.answer("🚗 **Бот для Госуслуг**\n\nКоманды:\n/login - Авторизоваться\n/pay - Проверить штраф по УИН")
+    await message.answer(
+        "🚗 **Бот для Госуслуг**\n\n"
+        "Команды:\n"
+        "/login - Авторизоваться\n"
+        "/pay - Проверить штраф по УИН\n"
+        "/stop - Остановить текущий процесс и закрыть браузер"
+    )
 
 
 @dp.message(Command("login"))
@@ -749,6 +768,34 @@ async def login_cmd(message: Message):
         await user_data[chat_id]["client"].close()
     user_data[chat_id] = {"client": GosuslugiBrowserClient()}
     await message.answer("Введите ваш логин от Госуслуг (телефон, почта или СНИЛС):")
+
+
+@dp.message(Command("stop"))
+async def stop_cmd(message: Message):
+    chat_id = message.chat.id
+
+    # Отменяем текущую задачу (поиск/оплата) прямо на месте — CancelledError
+    # прервёт её на ближайшем await внутри Playwright-вызова.
+    task = active_tasks.get(chat_id)
+    was_running = bool(task and not task.done())
+    if was_running:
+        task.cancel()
+
+    # И параллельно закрываем браузер — двойная страховка: даже если где-то
+    # отмена не подхватится сразу, закрытый context/playwright оборвёт любые
+    # висящие операции с ошибкой соединения.
+    client = user_data.get(chat_id, {}).get("client")
+    if client:
+        await client.close()
+
+    user_state[chat_id] = None
+    user_data.pop(chat_id, None)
+    active_tasks.pop(chat_id, None)
+
+    if was_running:
+        await message.answer("🛑 Останавливаю процесс и закрываю браузер. Для новой попытки — /login.")
+    else:
+        await message.answer("🛑 Активных процессов не было. Браузер закрыт (если был открыт). Для новой попытки — /login.")
 
 
 @dp.message(Command("pay"))
@@ -781,6 +828,9 @@ async def pay_cmd(message: Message):
 @dp.message(lambda message: message.text and not message.text.startswith("/"))
 async def process_steps(message: Message):
     chat_id = message.chat.id
+    # Регистрируем текущую задачу, чтобы /stop мог её отменить, даже если
+    # это долгий поиск/оплата на нескольких вкладках.
+    active_tasks[chat_id] = asyncio.current_task()
     state = user_state.get(chat_id)
     client = user_data.get(chat_id, {}).get("client")
 
