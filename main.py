@@ -441,16 +441,31 @@ class GosuslugiBrowserClient:
         )
         threeds_selector = (
             "*:has-text('3-D Secure'), *:has-text('3DS'), "
-            "*:has-text('Подтверждение платежа'), *:has-text('код из смс' ), "
-            "*:has-text('код из СМС'), input[name*='otp' i]"
+            "*:has-text('Подтверждение платежа'), *:has-text('Подтверждение операции'), "
+            "*:has-text('код из смс'), *:has-text('код из СМС'), "
+            "*:has-text('Сбербанк'), *:has-text('SberPay'), *:has-text('Идентификация'), "
+            "input[name*='otp' i]"
         )
-        cancel_selector = "button:has-text('Отмена'), button:has-text('Отменить'), button:has-text('Cancel')"
+        # Кнопка "Отмена"/"Отменить" — самый надёжный признак банковской
+        # 3DS-страницы (у самих Госуслуг такой кнопки на исходе платежа нет),
+        # поэтому её наличие проверяем раньше угаданного текста.
+        cancel_selector = (
+            "button:has-text('Отмена'), button:has-text('Отменить'), button:has-text('Cancel'), "
+            "a:has-text('Отмена'), a:has-text('Отменить'), "
+            "input[type='button'][value*='Отмена' i], input[type='submit'][value*='Отмена' i], "
+            "*[role='button']:has-text('Отмена')"
+        )
+        bank_domain_hints = ("sberbank", "sber", "3ds", "acs", "securepay")
 
         outcome = None
         for _ in range(8):  # опрашиваем ~40 секунд — банк может отвечать не сразу
             for frame in self.page.frames:
                 try:
-                    if await frame.locator(threeds_selector).count() > 0:
+                    if await frame.locator(cancel_selector).count() > 0:
+                        outcome = "3ds"
+                    elif any(hint in frame.url.lower() for hint in bank_domain_hints):
+                        outcome = "3ds"
+                    elif await frame.locator(threeds_selector).count() > 0:
                         outcome = "3ds"
                     elif await frame.locator(declined_selector).count() > 0:
                         outcome = "declined"
@@ -471,22 +486,55 @@ class GosuslugiBrowserClient:
             return "declined", "❌ Платёж отклонён банком."
 
         if outcome == "3ds":
+            # Домен банка мог сработать раньше, чем страница дорисовала кнопку —
+            # даём ей до 10 сек показаться, прежде чем сдаваться.
             clicked = False
             for frame in self.page.frames:
                 try:
+                    await frame.wait_for_selector(cancel_selector, state="visible", timeout=10000)
                     btn = frame.locator(cancel_selector).first
-                    if await btn.count() > 0:
-                        await btn.click()
-                        clicked = True
-                        break
+                    await btn.click()
+                    clicked = True
+                    break
+                except PlaywrightTimeoutError:
+                    continue
                 except Exception:
                     continue
-            if not clicked:
-                logger.warning("3DS обнаружен, но кнопку отмены найти не удалось — оставляю окно как есть.")
-            return "3ds", "🚫 3DS платёж отменён"
 
-        # Ни один из ожидаемых исходов не найден — логируем реальную картину,
-        # чтобы точно подставить правильные селекторы, а не гадать заново.
+            if clicked:
+                return "3ds", "🚫 3DS платёж отменён"
+
+            # Кнопку отмены не нашли — это ровно та ситуация, которая раньше
+            # приводила к зависанию/некорректному состоянию платежа. Логируем
+            # разметку страницы, чтобы точно подставить селектор кнопки.
+            for frame in self.page.frames:
+                try:
+                    text = await frame.inner_text("body")
+                    logger.info("3DS без кнопки отмены — фрейм %s: %s", frame.url, text[:400])
+                except Exception:
+                    logger.info("3DS без кнопки отмены — фрейм %s: не удалось прочитать текст", frame.url)
+            try:
+                await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "3ds_no_cancel_button.png"))
+            except Exception:
+                pass
+            logger.warning("3DS обнаружен, но кнопку отмены найти не удалось — платёж остался незавершённым.")
+            return "3ds", "⚠️ Обнаружена 3DS-страница банка, но кнопку «Отмена» найти не удалось — проверьте окно браузера вручную, платёж может остаться незавершённым."
+
+        # Ни один из ожидаемых исходов не найден. На всякий случай проверяем,
+        # не осталась ли где-то незакрытая кнопка "Отмена" (мало ли угадали
+        # не весь текст 3DS, а только её) — лучше закрыть платёж чисто, чем
+        # оставить Госуслуги в подвешенном состоянии.
+        for frame in self.page.frames:
+            try:
+                btn = frame.locator(cancel_selector).first
+                if await btn.count() > 0:
+                    await btn.click()
+                    return "3ds", "🚫 3DS платёж отменён"
+            except Exception:
+                continue
+
+        # Логируем реальную картину, чтобы точно подставить правильные
+        # селекторы, а не гадать заново.
         try:
             logger.info("Итог платежа не распознан. Фреймов: %d", len(self.page.frames))
             for frame in self.page.frames:
