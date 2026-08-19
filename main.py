@@ -617,23 +617,37 @@ class GosuslugiBrowserClient:
         digits = re.sub(r"\D", "", card_num)
         return f"•••• {digits[-4:]}" if len(digits) >= 4 else "••••"
 
-    async def pay_with_cards(self, cards, send_fn, page):
-        """Пробует карты по очереди (номер, срок, cvv), пока платёж не пройдёт
-        успешно, или карты не закончатся. После каждой попытки вызывает
-        send_fn(text) с результатом именно по этой карте. Останавливается
-        сразу после первого успеха. page передаётся явно — так на одной и той
-        же вкладке или на разных (для параллельной оплаты) можно вызывать
-        этот метод независимо."""
+    async def pay_with_cards(self, card_pool, send_fn, page):
+        """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
+        пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
+        одним и тем же списком, переданным нескольким параллельным вызовам этого
+        метода (для одновременной оплаты нескольких штрафов одними картами) —
+        каждая карта забирается из пула ОДИН раз (через .pop(0)), поэтому две
+        параллельные оплаты никогда не возьмут одну и ту же карту одновременно.
+        asyncio однопоточный, а между проверкой пула и .pop(0) нет await,
+        поэтому гонки за карту здесь в принципе не возникает.
+        После каждой попытки вызывает send_fn(text) с результатом по карте.
+        page передаётся явно, чтобы разные вызовы работали на разных вкладках."""
         if not page:
             await send_fn("Браузер не активен.")
             return False
 
         payment_url = page.url
+        attempt = 0
 
-        for index, (card_num, expiry, cvv) in enumerate(cards, start=1):
+        while True:
+            if not card_pool:
+                if attempt == 0:
+                    await send_fn("🚫 Свободных карт в общем пуле не осталось.")
+                else:
+                    await send_fn("🚫 Карты в общем пуле закончились, платёж не прошёл ни на одной.")
+                return False
+
+            card_num, expiry, cvv = card_pool.pop(0)
+            attempt += 1
             masked = self._mask_card(card_num)
 
-            if index > 1:
+            if attempt > 1:
                 # После неудачной попытки страница могла остаться в непонятном
                 # состоянии (экран отказа, отменённый 3DS и т.п.) — перед
                 # следующей картой возвращаемся на чистую страницу оплаты.
@@ -643,15 +657,12 @@ class GosuslugiBrowserClient:
                 except Exception as e:
                     await send_fn(f"⚠️ Не удалось перезагрузить страницу оплаты перед картой {masked}: {e}")
 
-            await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): пробую оплатить...")
+            await send_fn(f"💳 Карта {masked}: пробую оплатить...")
             status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
-            await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): {message}")
+            await send_fn(f"💳 Карта {masked}: {message}")
 
             if status == "success":
                 return True
-
-        await send_fn("🚫 Ни одна из карт не сработала.")
-        return False
 
     async def close(self):
         self.logged_in = False
