@@ -274,7 +274,11 @@ class GosuslugiBrowserClient:
                 await asyncio.sleep(4)
 
             amount_line = f" К оплате: {amount_str} ₽." if amount_str else ""
-            return True, f"✅ Штраф найден!{amount_line} Введите данные карты в формате: номер|дата|cvv"
+            return True, (
+                f"✅ Штраф найден!{amount_line} Введите данные карты в формате: номер|дата|cvv\n"
+                "Можно несколько карт — каждую с новой строки, бот будет пробовать их по очереди, "
+                "пока платёж не пройдёт."
+            )
         except Exception as e:
             try:
                 if self.page:
@@ -284,9 +288,12 @@ class GosuslugiBrowserClient:
             current_url = self.page.url if self.page else "?"
             return False, f"Ошибка поиска: {str(e)} (страница: {current_url})"
 
-    async def pay_by_card_auto(self, card_num, expiry, cvv):
+    async def _submit_single_card(self, card_num, expiry, cvv):
+        """Заполняет форму оплаты одной картой и возвращает (статус, сообщение).
+        Статус — одно из: 'success', 'declined', '3ds', 'unknown', 'error'.
+        Используется как внутренний шаг pay_with_cards() при переборе карт."""
         try:
-            if not self.page: return False, "Браузер не активен."
+            if not self.page: return "error", "Браузер не активен."
 
             # СТАРЫЙ БАГ: URL страницы оплаты — payment.gosuslugi.ru, поэтому
             # подстрока "pay" всегда находится в URL ГЛАВНОГО фрейма и код
@@ -321,7 +328,11 @@ class GosuslugiBrowserClient:
                         logger.info("Фрейм %s — input'ы: %s", frame.url, inputs_info)
                     except Exception as diag_err:
                         logger.warning("Не удалось прочитать input'ы фрейма %s: %s", frame.url, diag_err)
-                raise PlaywrightTimeoutError("поле номера карты не найдено ни на странице, ни во фреймах")
+                try:
+                    await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_pay_by_card.png"))
+                except Exception:
+                    pass
+                return "error", "поле номера карты не найдено ни на странице, ни во фреймах (см. лог)."
 
             expiry_selector = (
                 "input[autocomplete*='cc-exp' i], input[placeholder*='ММ' i], "
@@ -345,7 +356,7 @@ class GosuslugiBrowserClient:
             except Exception:
                 pass
             current_url = self.page.url if self.page else "?"
-            return False, f"Не удалось автоматически заполнить карту: {str(e)} (страница: {current_url})"
+            return "error", f"Не удалось автоматически заполнить карту: {str(e)} (страница: {current_url})"
 
     async def _await_payment_outcome(self):
         """После клика 'Оплатить' смотрим, что реально ответил сайт: успех,
@@ -390,10 +401,10 @@ class GosuslugiBrowserClient:
             await asyncio.sleep(5)
 
         if outcome == "success":
-            return True, "✅ Платёж успешно проведён!"
+            return "success", "✅ Платёж успешно проведён!"
 
         if outcome == "declined":
-            return True, "❌ Платёж отклонён банком."
+            return "declined", "❌ Платёж отклонён банком."
 
         if outcome == "3ds":
             clicked = False
@@ -408,7 +419,7 @@ class GosuslugiBrowserClient:
                     continue
             if not clicked:
                 logger.warning("3DS обнаружен, но кнопку отмены найти не удалось — оставляю окно как есть.")
-            return True, "🚫 3DS платёж отменён"
+            return "3ds", "🚫 3DS платёж отменён"
 
         # Ни один из ожидаемых исходов не найден — логируем реальную картину,
         # чтобы точно подставить правильные селекторы, а не гадать заново.
@@ -428,7 +439,46 @@ class GosuslugiBrowserClient:
         except Exception:
             pass
 
-        return True, "⏳ Не удалось точно распознать результат платежа. Проверьте окно браузера — там видно, что произошло."
+        return "unknown", "⏳ Не удалось точно распознать результат платежа. Проверьте окно браузера — там видно, что произошло."
+
+    @staticmethod
+    def _mask_card(card_num):
+        digits = re.sub(r"\D", "", card_num)
+        return f"•••• {digits[-4:]}" if len(digits) >= 4 else "••••"
+
+    async def pay_with_cards(self, cards, send_fn):
+        """Пробует карты по очереди (номер, срок, cvv), пока платёж не пройдёт
+        успешно, или карты не закончатся. После каждой попытки вызывает
+        send_fn(text) с результатом именно по этой карте. Останавливается
+        сразу после первого успеха."""
+        if not self.page:
+            await send_fn("Браузер не активен.")
+            return False
+
+        payment_url = self.page.url
+
+        for index, (card_num, expiry, cvv) in enumerate(cards, start=1):
+            masked = self._mask_card(card_num)
+
+            if index > 1:
+                # После неудачной попытки страница могла остаться в непонятном
+                # состоянии (экран отказа, отменённый 3DS и т.п.) — перед
+                # следующей картой возвращаемся на чистую страницу оплаты.
+                try:
+                    await self.page.goto(payment_url, wait_until="load")
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    await send_fn(f"⚠️ Не удалось перезагрузить страницу оплаты перед картой {masked}: {e}")
+
+            await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): пробую оплатить...")
+            status, message = await self._submit_single_card(card_num, expiry, cvv)
+            await send_fn(f"💳 Карта {index}/{len(cards)} ({masked}): {message}")
+
+            if status == "success":
+                return True
+
+        await send_fn("🚫 Ни одна из карт не сработала.")
+        return False
 
     async def close(self):
         self.logged_in = False
@@ -519,13 +569,30 @@ async def process_steps(message: Message):
         else:
             user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
     elif state == "waiting_card_info":
-        parts = message.text.split("|")
-        if len(parts) < 3:
-            await message.answer("❌ Неверный формат. Введите строго через вертикальную черту:\nномер|дата|cvv")
+        # Можно ввести несколько карт — каждую с новой строки в формате номер|дата|cvv.
+        # Бот пробует их по очереди и останавливается на первой успешной оплате.
+        lines = [line.strip() for line in message.text.splitlines() if line.strip()]
+        cards = []
+        for line in lines:
+            parts = line.split("|")
+            if len(parts) < 3:
+                await message.answer(
+                    f"❌ Неверный формат в строке «{line}». Нужно: номер|дата|cvv "
+                    "(можно несколько строк, по одной карте на строку)."
+                )
+                return
+            cards.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+
+        if not cards:
+            await message.answer("❌ Не нашёл ни одной карты. Введите: номер|дата|cvv")
             return
-        await message.answer("⏳ Автоматически заполняю реквизиты карты на сайте...")
-        success, res_msg = await client.pay_by_card_auto(parts[0].strip(), parts[1].strip(), parts[2].strip())
-        await message.answer(res_msg)
+
+        await message.answer(f"⏳ Начинаю оплату, карт в очереди: {len(cards)}...")
+
+        async def send(text):
+            await message.answer(text)
+
+        await client.pay_with_cards(cards, send)
         user_state[chat_id] = "ready_for_pay"
 
 
