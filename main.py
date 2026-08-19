@@ -491,6 +491,25 @@ class GosuslugiBrowserClient:
             "*[role='button']:has-text('Отмена')"
         )
         bank_domain_hints = ("sberbank", "sber", "3ds", "acs", "securepay")
+        # После клика "Отмена" банк иногда переспрашивает: "Уверены, что хотите
+        # отменить покупку?" с кнопками "Вернуться к подтверждению" / "Да, отменить".
+        confirm_cancel_selector = (
+            "button:has-text('Да, отменить'), a:has-text('Да, отменить'), "
+            "*[role='button']:has-text('Да, отменить')"
+        )
+
+        async def confirm_cancel_if_asked():
+            await asyncio.sleep(1.5)
+            for frame in self.page.frames:
+                try:
+                    confirm_btn = frame.locator(confirm_cancel_selector).first
+                    if await confirm_btn.count() > 0:
+                        await confirm_btn.click()
+                        logger.info("Подтвердил повторный запрос отмены 3DS ('Да, отменить').")
+                        return True
+                except Exception:
+                    continue
+            return False
 
         outcome = None
         for _ in range(8):  # опрашиваем ~40 секунд — банк может отвечать не сразу
@@ -537,6 +556,7 @@ class GosuslugiBrowserClient:
                     continue
 
             if clicked:
+                await confirm_cancel_if_asked()
                 return "3ds", "🚫 3DS платёж отменён"
 
             # Кнопку отмены не нашли — это ровно та ситуация, которая раньше
@@ -564,6 +584,7 @@ class GosuslugiBrowserClient:
                 btn = frame.locator(cancel_selector).first
                 if await btn.count() > 0:
                     await btn.click()
+                    await confirm_cancel_if_asked()
                     return "3ds", "🚫 3DS платёж отменён"
             except Exception:
                 continue
