@@ -477,6 +477,12 @@ class GosuslugiBrowserClient:
             "*:has-text('Ошибка оплаты'), *:has-text('Платёж не прошёл'), "
             "*:has-text('Платеж не прошел')"
         )
+        # "Платёж в обработке" — банк принял платёж, но ещё не подтвердил.
+        # Это не отказ и не 3DS — при таком статусе новую карту пробовать не нужно.
+        processing_selector = (
+            "*:has-text('в обработке'), *:has-text('Платёж в обработке'), "
+            "*:has-text('обрабатывается')"
+        )
         threeds_selector = (
             "*:has-text('3-D Secure'), *:has-text('3DS'), "
             "*:has-text('Подтверждение платежа'), *:has-text('Подтверждение операции'), "
@@ -516,25 +522,41 @@ class GosuslugiBrowserClient:
 
         outcome = None
         for _ in range(8):  # опрашиваем ~40 секунд — банк может отвечать не сразу
-            for frame in page.frames:
-                try:
-                    if await frame.locator(cancel_selector).count() > 0:
-                        outcome = "3ds"
-                    elif any(hint in frame.url.lower() for hint in bank_domain_hints):
-                        outcome = "3ds"
-                    elif await frame.locator(threeds_selector).count() > 0:
-                        outcome = "3ds"
-                    elif await frame.locator(declined_selector).count() > 0:
-                        outcome = "declined"
-                    elif await frame.locator(success_selector).count() > 0:
-                        outcome = "success"
-                    if outcome:
-                        break
-                except Exception:
-                    continue
+            # СНАЧАЛА проверяем однозначные текстовые статусы на самой странице
+            # Госуслуг (обработка/отказ/успех) — они надёжнее эвристики "домен
+            # похож на банк" ниже. Та эвристика однажды ложно сработала на уже
+            # неактуальном/скрытом iframe от прошлого шага 3DS, из-за чего бот
+            # пытался отменить платёж, который на самом деле просто "в обработке".
+            try:
+                if await page.locator(processing_selector).count() > 0:
+                    outcome = "processing"
+                elif await page.locator(declined_selector).count() > 0:
+                    outcome = "declined"
+                elif await page.locator(success_selector).count() > 0:
+                    outcome = "success"
+            except Exception:
+                pass
+
+            if not outcome:
+                for frame in page.frames:
+                    try:
+                        if await frame.locator(cancel_selector).count() > 0:
+                            outcome = "3ds"
+                        elif any(hint in frame.url.lower() for hint in bank_domain_hints):
+                            outcome = "3ds"
+                        elif await frame.locator(threeds_selector).count() > 0:
+                            outcome = "3ds"
+                        if outcome:
+                            break
+                    except Exception:
+                        continue
+
             if outcome:
                 break
             await asyncio.sleep(5)
+
+        if outcome == "processing":
+            return "processing", "⏳ Платёж в обработке."
 
         if outcome == "success":
             return "success", "✅ Платёж успешно проведён!"
@@ -635,6 +657,7 @@ class GosuslugiBrowserClient:
         page передаётся явно, чтобы разные вызовы работали на разных вкладках."""
         SHORT_STATUS = {
             "success": "✅",
+            "processing": "⏳ в обработке",
             "declined": "❌",
             "3ds": "🚫 3DS",
             "unknown": "❓",
@@ -672,7 +695,9 @@ class GosuslugiBrowserClient:
             logger.info("Карта %s — статус %s: %s", masked, status, message)
             await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", True)
 
-            if status == "success":
+            if status in ("success", "processing"):
+                # "В обработке" — банк уже принял платёж, следующую карту
+                # пробовать не нужно (это не отказ).
                 return True
 
     async def close(self):
