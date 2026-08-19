@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
@@ -184,6 +185,17 @@ class GosuslugiBrowserClient:
                     return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно."
                 raise PlaywrightTimeoutError("сумма штрафа не появилась ни на странице, ни во фреймах")
 
+            # Достаём сумму штрафа для вывода в сообщении пользователю.
+            # Внимание: символ рубля в тексте страницы — это буква "Р", не "₽".
+            amount_str = None
+            try:
+                body_text = await self.page.inner_text("body")
+                amount_match = re.search(r"(\d[\d \s]*\d)\s*Р(?![а-яёА-ЯЁ])", body_text)
+                if amount_match:
+                    amount_str = amount_match.group(1).replace(" ", " ").strip()
+            except Exception:
+                pass
+
             pay_button = self.page.locator("button:has-text('Оплатить'), button:has-text('Перейти к оплате')").first
             await pay_button.wait_for(state="visible", timeout=15000)
 
@@ -201,7 +213,8 @@ class GosuslugiBrowserClient:
                 # Новая вкладка не появилась — форма оплаты, скорее всего, на этой же странице
                 await asyncio.sleep(4)
 
-            return True, "✅ Штраф найден! Введите данные карты в формате: номер|дата|cvv"
+            amount_line = f" К оплате: {amount_str} ₽." if amount_str else ""
+            return True, f"✅ Штраф найден!{amount_line} Введите данные карты в формате: номер|дата|cvv"
         except Exception as e:
             try:
                 if self.page:
@@ -214,16 +227,54 @@ class GosuslugiBrowserClient:
     async def pay_by_card_auto(self, card_num, expiry, cvv):
         try:
             if not self.page: return False, "Браузер не активен."
-            target = self.page
-            if len(self.page.frames) > 1:
+
+            # СТАРЫЙ БАГ: URL страницы оплаты — payment.gosuslugi.ru, поэтому
+            # подстрока "pay" всегда находится в URL ГЛАВНОГО фрейма и код
+            # ошибочно останавливался на нём, даже если карта вводится в
+            # отдельном iframe. Теперь ищем реальный фрейм по наличию в нём
+            # видимого поля номера карты, а не по угаданной подстроке в URL.
+            card_selector = (
+                "input[autocomplete*='cc-number' i], input[inputmode='numeric'], "
+                "input[placeholder*='номер' i], input[name*='card' i], "
+                "input[name*='pan' i], input[data-testid*='card' i], input[type='tel']"
+            )
+
+            target = None
+            for frame in self.page.frames:
+                try:
+                    await frame.wait_for_selector(card_selector, state="visible", timeout=8000)
+                    target = frame
+                    break
+                except PlaywrightTimeoutError:
+                    continue
+
+            if target is None:
+                # Диагностика: логируем реальные атрибуты всех input на странице
+                # и во всех фреймах, чтобы не гадать с селекторами вслепую.
                 for frame in self.page.frames:
-                    if "card" in frame.url or "pay" in frame.url:
-                        target = frame
-                        break
-            await target.wait_for_selector("input[placeholder*='номер'], input[name*='card']", timeout=15000)
-            await target.fill("input[placeholder*='номер'], input[name*='card']", card_num)
-            await target.fill("input[placeholder*='дата'], input[placeholder*='MM']", expiry)
-            await target.fill("input[placeholder*='CVV'], input[placeholder*='CVC']", cvv)
+                    try:
+                        inputs_info = await frame.eval_on_selector_all(
+                            "input",
+                            "els => els.map(e => ({name:e.name, id:e.id, placeholder:e.placeholder, "
+                            "type:e.type, autocomplete:e.autocomplete}))"
+                        )
+                        logger.info("Фрейм %s — input'ы: %s", frame.url, inputs_info)
+                    except Exception as diag_err:
+                        logger.warning("Не удалось прочитать input'ы фрейма %s: %s", frame.url, diag_err)
+                raise PlaywrightTimeoutError("поле номера карты не найдено ни на странице, ни во фреймах")
+
+            expiry_selector = (
+                "input[autocomplete*='cc-exp' i], input[placeholder*='ММ' i], "
+                "input[placeholder*='MM' i], input[placeholder*='срок' i], input[name*='exp' i]"
+            )
+            cvv_selector = (
+                "input[autocomplete*='cc-csc' i], input[placeholder*='CVV' i], "
+                "input[placeholder*='CVC' i], input[name*='cvv' i], input[name*='cvc' i]"
+            )
+
+            await target.fill(card_selector, card_num)
+            await target.fill(expiry_selector, expiry)
+            await target.fill(cvv_selector, cvv)
             await target.click("button:has-text('Оплатить'), button[type='submit']")
             return True, "⏳ Данные карты успешно введены! Завершите платеж по СМС в окне на вашем ПК."
         except Exception as e:
