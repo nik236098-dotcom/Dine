@@ -756,7 +756,7 @@ async def start(message: Message):
         "Команды:\n"
         "/login - Авторизоваться\n"
         "/pay - Проверить штраф по УИН\n"
-        "/stop - Остановить текущий процесс и закрыть браузер"
+        "/stop - Остановить текущий процесс (браузер остаётся открытым)"
     )
 
 
@@ -775,27 +775,25 @@ async def stop_cmd(message: Message):
     chat_id = message.chat.id
 
     # Отменяем текущую задачу (поиск/оплата) прямо на месте — CancelledError
-    # прервёт её на ближайшем await внутри Playwright-вызова.
+    # прервёт её на ближайшем await внутри Playwright-вызова. Браузер и сессию
+    # входа НЕ трогаем — только останавливаем процесс, чтобы можно было сразу
+    # начать заново без повторного /login.
     task = active_tasks.get(chat_id)
     was_running = bool(task and not task.done())
     if was_running:
         task.cancel()
-
-    # И параллельно закрываем браузер — двойная страховка: даже если где-то
-    # отмена не подхватится сразу, закрытый context/playwright оборвёт любые
-    # висящие операции с ошибкой соединения.
-    client = user_data.get(chat_id, {}).get("client")
-    if client:
-        await client.close()
-
-    user_state[chat_id] = None
-    user_data.pop(chat_id, None)
     active_tasks.pop(chat_id, None)
 
+    if chat_id in user_data:
+        user_data[chat_id].pop("pending_fines", None)
+
+    client = user_data.get(chat_id, {}).get("client")
+    user_state[chat_id] = "ready_for_pay" if client and client.logged_in else None
+
     if was_running:
-        await message.answer("🛑 Останавливаю процесс и закрываю браузер. Для новой попытки — /login.")
+        await message.answer("🛑 Процесс остановлен. Браузер и сессия входа не тронуты — можно продолжать через /pay.")
     else:
-        await message.answer("🛑 Активных процессов не было. Браузер закрыт (если был открыт). Для новой попытки — /login.")
+        await message.answer("🛑 Активных процессов не было.")
 
 
 @dp.message(Command("pay"))
