@@ -288,6 +288,55 @@ class GosuslugiBrowserClient:
             current_url = self.page.url if self.page else "?"
             return False, f"Ошибка поиска: {str(e)} (страница: {current_url})"
 
+    async def _wait_for_gazprombank(self, target, card_selector, card_num, max_attempts=10):
+        """Госуслуги выбирают банк-эквайер для платежа заново при каждом новом
+        вводе номера карты; какой банк выбран — видно после клика по ссылке
+        'Без комиссии банка'. Газпромбанк проводит этот платёж без комиссии,
+        остальные — нет. Если банк не тот, стираем номер карты и вводим его
+        заново (с паузой, не быстро), пока не выпадет Газпромбанк или не
+        кончатся попытки. Возвращает True, если Газпромбанк подтверждён."""
+        bank_link_selector = (
+            "a:has-text('Без комиссии банка'), button:has-text('Без комиссии банка'), "
+            "*:has-text('Без комиссии банка')"
+        )
+        target_bank_names = ("Газпромбанк", "ГПБ", "Gazprombank")
+
+        for attempt in range(1, max_attempts + 1):
+            await asyncio.sleep(2)  # не быстро — как раз то время, чтобы сайт показал банк
+
+            bank_text = ""
+            try:
+                bank_link = target.locator(bank_link_selector).first
+                if await bank_link.count() > 0:
+                    await bank_link.click()
+                    await asyncio.sleep(1)
+                    bank_text = await target.inner_text("body")
+            except Exception as e:
+                logger.warning("Не удалось прочитать банк-эквайер (попытка %d): %s", attempt, e)
+
+            if any(name in bank_text for name in target_bank_names):
+                logger.info("Газпромбанк подтверждён с попытки %d", attempt)
+                return True
+
+            logger.info(
+                "Попытка %d/%d: банк не Газпромбанк (или не определился) — ввожу карту заново",
+                attempt, max_attempts
+            )
+
+            if attempt < max_attempts:
+                try:
+                    card_input = target.locator(card_selector).first
+                    await card_input.click()
+                    await card_input.fill("")
+                    await asyncio.sleep(0.5)
+                    await card_input.fill(card_num)
+                except Exception as e:
+                    logger.warning("Не удалось перевести карту заново (попытка %d): %s", attempt, e)
+                    break
+
+        logger.warning("Газпромбанк не подтвердился за %d попыток — продолжаю с текущим банком.", max_attempts)
+        return False
+
     async def _submit_single_card(self, card_num, expiry, cvv):
         """Заполняет форму оплаты одной картой и возвращает (статус, сообщение).
         Статус — одно из: 'success', 'declined', '3ds', 'unknown', 'error'.
@@ -344,11 +393,16 @@ class GosuslugiBrowserClient:
             )
 
             await target.fill(card_selector, card_num)
+
+            got_gazprombank = await self._wait_for_gazprombank(target, card_selector, card_num)
+            bank_note = "" if got_gazprombank else " ⚠️ Газпромбанк не подтвердился — возможна комиссия."
+
             await target.fill(expiry_selector, expiry)
             await target.fill(cvv_selector, cvv)
             await target.click("button:has-text('Оплатить'), button[type='submit']")
 
-            return await self._await_payment_outcome()
+            status, message = await self._await_payment_outcome()
+            return status, message + bank_note
         except Exception as e:
             try:
                 if self.page:
