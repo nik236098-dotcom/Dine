@@ -297,63 +297,54 @@ class GosuslugiBrowserClient:
         60 попыток — это до ~3 минут). Если банк не тот, стираем номер карты
         и вводим его заново, пока не выпадет Газпромбанк или не кончатся
         попытки. Возвращает True, если Газпромбанк подтверждён."""
-        # Кликабельно именно слово "банка" внутри фразы "Без комиссии банка",
-        # а не вся фраза целиком — клик по родительскому блоку с текстом ничего
-        # не открывал, поэтому банк и не определялся. :text-is() ищет элемент,
-        # чей собственный текст — точно это слово (а не просто содержит его).
+        # Кликабельно именно слово "банка" внутри фразы "Без комиссии банка".
+        # Клик открывает модалку "Информация о платеже" с текстом вида
+        # 'Перевод пройдёт через «НАЗВАНИЕ БАНКА» ...' и кнопкой "Закрыть".
         bank_link_selector = (
             "a:text-is('банка'), button:text-is('банка'), span:text-is('банка'), "
             "u:text-is('банка'), *:text-is('банка'), "
             "a:has-text('Без комиссии банка'), button:has-text('Без комиссии банка')"
         )
-        # Ищем без учёта регистра и по разным написаниям: название банка может
-        # быть в обычном тексте, а может быть только в alt/src картинки-логотипа
-        # (тогда в видимом тексте страницы его вообще не будет).
-        target_bank_names = ("газпромбанк", "гпб", "gazprombank", "gazprom")
+        modal_selector = "*:has-text('Информация о платеже')"
+        close_button_selector = "button:has-text('Закрыть'), button:text-is('Закрыть')"
+        target_bank_names = ("газпромбанк", "гпб", "gazprombank")
 
         for attempt in range(1, max_attempts + 1):
             await asyncio.sleep(2)  # не быстро — как раз то время, чтобы сайт показал банк
 
-            # Смотрим текст ДО клика — вдруг банк уже виден и клик не нужен
-            # (или, того хуже, клик просто закрывает уже открытую подсказку).
-            combined_text = ""
-            try:
-                combined_text += (await target.inner_text("body")).lower()
-            except Exception:
-                pass
-
+            # ВАЖНО: раньше проверялся весь текст страницы (и даже все картинки) —
+            # где-то на странице статично упоминается "Газпромбанк" (например,
+            # в списке поддерживаемых банков), поэтому проверка срабатывала
+            # всегда, независимо от реально выбранного банка. Теперь смотрим
+            # ТОЛЬКО текст внутри самой модалки с результатом.
+            modal_text = ""
             try:
                 bank_link = target.locator(bank_link_selector).first
                 if await bank_link.count() > 0:
                     await bank_link.click()
                     await asyncio.sleep(1)
-                    combined_text += (await target.inner_text("body")).lower()
+                    modal = target.locator(modal_selector).last
+                    if await modal.count() > 0:
+                        modal_text = (await modal.inner_text()).lower()
             except Exception as e:
                 logger.warning("Не удалось прочитать банк-эквайер (попытка %d): %s", attempt, e)
 
-            # Название банка может быть только в картинке-логотипе (alt/src/title),
-            # а не в тексте страницы — проверяем и это.
-            images_info = []
-            try:
-                images_info = await target.eval_on_selector_all(
-                    "img", "els => els.map(e => ({alt: e.alt, src: e.src, title: e.title}))"
-                )
-            except Exception:
-                pass
-            images_blob = " ".join(
-                f"{img.get('alt', '')} {img.get('src', '')} {img.get('title', '')}" for img in images_info
-            ).lower()
-
-            # Первые несколько попыток логируем подробно — чтобы по реальным
-            # данным поправить селекторы/названия, если угадали не всё.
             if attempt <= 3:
-                logger.info(
-                    "Банк, попытка %d — текст (первые 300 симв.): %s | картинки: %s",
-                    attempt, combined_text[:300], images_blob[:300]
-                )
+                logger.info("Банк, попытка %d — текст модалки: %s", attempt, modal_text[:300])
 
-            if any(name in combined_text for name in target_bank_names) or \
-               any(name in images_blob for name in target_bank_names):
+            matched = any(name in modal_text for name in target_bank_names)
+
+            # Модалку обязательно закрываем в любом случае — иначе она
+            # перекрывает поле карты и следующая попытка ничего не сможет ввести.
+            try:
+                close_btn = target.locator(close_button_selector).first
+                if await close_btn.count() > 0:
+                    await close_btn.click()
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning("Не удалось закрыть модалку с банком (попытка %d): %s", attempt, e)
+
+            if matched:
                 logger.info("Газпромбанк подтверждён с попытки %d", attempt)
                 return True
 
