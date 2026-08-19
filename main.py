@@ -158,7 +158,7 @@ class GosuslugiBrowserClient:
             found = False
             for frame in self.page.frames:
                 try:
-                    await frame.wait_for_selector(result_selector, state="visible", timeout=20000)
+                    await frame.wait_for_selector(result_selector, state="visible", timeout=30000)
                     found = True
                     break
                 except PlaywrightTimeoutError:
