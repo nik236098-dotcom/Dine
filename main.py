@@ -301,22 +301,54 @@ class GosuslugiBrowserClient:
             "a:has-text('Без комиссии банка'), button:has-text('Без комиссии банка'), "
             "*:has-text('Без комиссии банка')"
         )
-        target_bank_names = ("Газпромбанк", "ГПБ", "Gazprombank")
+        # Ищем без учёта регистра и по разным написаниям: название банка может
+        # быть в обычном тексте, а может быть только в alt/src картинки-логотипа
+        # (тогда в видимом тексте страницы его вообще не будет).
+        target_bank_names = ("газпромбанк", "гпб", "gazprombank", "gazprom")
 
         for attempt in range(1, max_attempts + 1):
             await asyncio.sleep(2)  # не быстро — как раз то время, чтобы сайт показал банк
 
-            bank_text = ""
+            # Смотрим текст ДО клика — вдруг банк уже виден и клик не нужен
+            # (или, того хуже, клик просто закрывает уже открытую подсказку).
+            combined_text = ""
+            try:
+                combined_text += (await target.inner_text("body")).lower()
+            except Exception:
+                pass
+
             try:
                 bank_link = target.locator(bank_link_selector).first
                 if await bank_link.count() > 0:
                     await bank_link.click()
                     await asyncio.sleep(1)
-                    bank_text = await target.inner_text("body")
+                    combined_text += (await target.inner_text("body")).lower()
             except Exception as e:
                 logger.warning("Не удалось прочитать банк-эквайер (попытка %d): %s", attempt, e)
 
-            if any(name in bank_text for name in target_bank_names):
+            # Название банка может быть только в картинке-логотипе (alt/src/title),
+            # а не в тексте страницы — проверяем и это.
+            images_info = []
+            try:
+                images_info = await target.eval_on_selector_all(
+                    "img", "els => els.map(e => ({alt: e.alt, src: e.src, title: e.title}))"
+                )
+            except Exception:
+                pass
+            images_blob = " ".join(
+                f"{img.get('alt', '')} {img.get('src', '')} {img.get('title', '')}" for img in images_info
+            ).lower()
+
+            # Первые несколько попыток логируем подробно — чтобы по реальным
+            # данным поправить селекторы/названия, если угадали не всё.
+            if attempt <= 3:
+                logger.info(
+                    "Банк, попытка %d — текст (первые 300 симв.): %s | картинки: %s",
+                    attempt, combined_text[:300], images_blob[:300]
+                )
+
+            if any(name in combined_text for name in target_bank_names) or \
+               any(name in images_blob for name in target_bank_names):
                 logger.info("Газпромбанк подтверждён с попытки %d", attempt)
                 return True
 
