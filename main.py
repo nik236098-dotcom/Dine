@@ -336,7 +336,8 @@ class GosuslugiBrowserClient:
             await target.fill(expiry_selector, expiry)
             await target.fill(cvv_selector, cvv)
             await target.click("button:has-text('Оплатить'), button[type='submit']")
-            return True, "⏳ Данные карты успешно введены! Завершите платеж по СМС в окне на вашем ПК."
+
+            return await self._await_payment_outcome()
         except Exception as e:
             try:
                 if self.page:
@@ -345,6 +346,89 @@ class GosuslugiBrowserClient:
                 pass
             current_url = self.page.url if self.page else "?"
             return False, f"Не удалось автоматически заполнить карту: {str(e)} (страница: {current_url})"
+
+    async def _await_payment_outcome(self):
+        """После клика 'Оплатить' смотрим, что реально ответил сайт: успех,
+        отказ или запрос 3DS-подтверждения. Точные тексты угаданы (реального
+        лога результата платежа ещё не было) — если ни один вариант не
+        совпадёт за отведённое время, в консоль пишется диагностика вместо
+        того чтобы просто соврать про успех, как было раньше."""
+        success_selector = (
+            "*:has-text('Платёж успешно'), *:has-text('Платеж успешно'), "
+            "*:has-text('успешно проведён'), *:has-text('успешно проведен'), "
+            "*:has-text('Оплата прошла'), *:has-text('Оплачено')"
+        )
+        declined_selector = (
+            "*:has-text('отклонен'), *:has-text('отклонён'), "
+            "*:has-text('Отказано'), *:has-text('не удалось провести'), "
+            "*:has-text('Ошибка оплаты'), *:has-text('Платёж не прошёл'), "
+            "*:has-text('Платеж не прошел')"
+        )
+        threeds_selector = (
+            "*:has-text('3-D Secure'), *:has-text('3DS'), "
+            "*:has-text('Подтверждение платежа'), *:has-text('код из смс' ), "
+            "*:has-text('код из СМС'), input[name*='otp' i]"
+        )
+        cancel_selector = "button:has-text('Отмена'), button:has-text('Отменить'), button:has-text('Cancel')"
+
+        outcome = None
+        for _ in range(8):  # опрашиваем ~40 секунд — банк может отвечать не сразу
+            for frame in self.page.frames:
+                try:
+                    if await frame.locator(threeds_selector).count() > 0:
+                        outcome = "3ds"
+                    elif await frame.locator(declined_selector).count() > 0:
+                        outcome = "declined"
+                    elif await frame.locator(success_selector).count() > 0:
+                        outcome = "success"
+                    if outcome:
+                        break
+                except Exception:
+                    continue
+            if outcome:
+                break
+            await asyncio.sleep(5)
+
+        if outcome == "success":
+            return True, "✅ Платёж успешно проведён!"
+
+        if outcome == "declined":
+            return True, "❌ Платёж отклонён банком."
+
+        if outcome == "3ds":
+            clicked = False
+            for frame in self.page.frames:
+                try:
+                    btn = frame.locator(cancel_selector).first
+                    if await btn.count() > 0:
+                        await btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                logger.warning("3DS обнаружен, но кнопку отмены найти не удалось — оставляю окно как есть.")
+            return True, "🚫 3DS платёж отменён"
+
+        # Ни один из ожидаемых исходов не найден — логируем реальную картину,
+        # чтобы точно подставить правильные селекторы, а не гадать заново.
+        try:
+            logger.info("Итог платежа не распознан. Фреймов: %d", len(self.page.frames))
+            for frame in self.page.frames:
+                try:
+                    text = await frame.inner_text("body")
+                    logger.info("Фрейм %s — первые 400 символов: %s", frame.url, text[:400])
+                except Exception:
+                    logger.info("Фрейм %s — не удалось прочитать текст", frame.url)
+        except Exception as diag_err:
+            logger.warning("Не удалось собрать диагностику по итогу платежа: %s", diag_err)
+
+        try:
+            await self.page.screenshot(path=os.path.join(BASE_DATA_DIR, "payment_outcome_unknown.png"))
+        except Exception:
+            pass
+
+        return True, "⏳ Не удалось точно распознать результат платежа. Проверьте окно браузера — там видно, что произошло."
 
     async def close(self):
         self.logged_in = False
