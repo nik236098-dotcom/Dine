@@ -146,9 +146,13 @@ class GosuslugiBrowserClient:
                 pass
             await asyncio.sleep(2)
 
+            # ВАЖНО: рубль на этой странице визуально похож на "₽", но фактически
+            # это кириллическая буква "Р" в специальном шрифте — поэтому поиск по
+            # символу "₽" никогда не срабатывал. Ищем по однозначному тексту:
+            # заголовку "Найдено ..." и кнопке "Оплатить", которые реально есть в DOM.
             result_selector = (
-                ".amount, .price, [class*='amount' i], [class*='price' i], "
-                "[class*='sum' i], *:has-text('₽')"
+                "*:has-text('Найдено'), button:has-text('Оплатить'), "
+                "button:has-text('Перейти к оплате')"
             )
             not_found_selector = (
                 "*:has-text('не найдено'), *:has-text('не найден'), "
@@ -171,7 +175,7 @@ class GosuslugiBrowserClient:
                 try:
                     body_text = await self.page.inner_text("body")
                     logger.info("Длина текста body: %d символов", len(body_text))
-                    logger.info("Вхождений '₽' в тексте: %d", body_text.count("₽"))
+                    logger.info("Вхождений 'Найдено' в тексте: %d", body_text.count("Найдено"))
                     logger.info("Первые 500 символов текста страницы: %s", body_text[:500])
                 except Exception as diag_err:
                     logger.warning("Не удалось прочитать текст страницы для диагностики: %s", diag_err)
