@@ -130,7 +130,36 @@ class GosuslugiBrowserClient:
             button = self.page.locator("button[type='submit'], button:has-text('Найти'), button:has-text('Проверить')").first
             await button.click()
 
-            await self.page.wait_for_selector(".amount, .price, *:has-text('₽')", timeout=15000)
+            # Даём странице время подгрузить результат поиска (это AJAX/React,
+            # а не обычная навигация) прежде чем искать сумму.
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=8000)
+            except PlaywrightTimeoutError:
+                pass
+            await asyncio.sleep(2)
+
+            result_selector = (
+                ".amount, .price, [class*='amount' i], [class*='price' i], "
+                "[class*='sum' i], *:has-text('₽')"
+            )
+            not_found_selector = (
+                "*:has-text('не найдено'), *:has-text('не найден'), "
+                "*:has-text('ничего не найдено'), *:has-text('отсутствует')"
+            )
+
+            found = False
+            for frame in self.page.frames:
+                try:
+                    await frame.wait_for_selector(result_selector, state="visible", timeout=20000)
+                    found = True
+                    break
+                except PlaywrightTimeoutError:
+                    continue
+
+            if not found:
+                if await self.page.locator(not_found_selector).count() > 0:
+                    return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно."
+                raise PlaywrightTimeoutError("сумма штрафа не появилась ни на странице, ни во фреймах")
 
             pay_button = self.page.locator("button:has-text('Оплатить'), button:has-text('Перейти к оплате')").first
             await pay_button.wait_for(state="visible", timeout=15000)
