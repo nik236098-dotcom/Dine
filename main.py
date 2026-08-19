@@ -155,6 +155,8 @@ class GosuslugiBrowserClient:
                 "*:has-text('ничего не найдено'), *:has-text('отсутствует')"
             )
 
+            logger.info("Всего фреймов на странице: %d", len(self.page.frames))
+
             found = False
             for frame in self.page.frames:
                 try:
@@ -165,6 +167,15 @@ class GosuslugiBrowserClient:
                     continue
 
             if not found:
+                # Точная диагностика: что реально видел Playwright в момент неудачи.
+                try:
+                    body_text = await self.page.inner_text("body")
+                    logger.info("Длина текста body: %d символов", len(body_text))
+                    logger.info("Вхождений '₽' в тексте: %d", body_text.count("₽"))
+                    logger.info("Первые 500 символов текста страницы: %s", body_text[:500])
+                except Exception as diag_err:
+                    logger.warning("Не удалось прочитать текст страницы для диагностики: %s", diag_err)
+
                 if await self.page.locator(not_found_selector).count() > 0:
                     return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно."
                 raise PlaywrightTimeoutError("сумма штрафа не появилась ни на странице, ни во фреймах")
