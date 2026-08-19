@@ -363,11 +363,11 @@ class GosuslugiBrowserClient:
                 attempt, max_attempts
             )
 
-            # Раз в 10 попыток даём знать в Telegram, что бот ещё работает,
-            # а не завис — угадывание банка может занять и минуту, и три.
+            # Раз в 10 попыток обновляем ТУ ЖЕ строку в статус-сообщении (не
+            # добавляем новую) — чтобы было видно, что бот жив, без спама.
             if send_fn and attempt % 10 == 0:
                 try:
-                    await send_fn(f"🔄 Всё ещё подбираю Газпромбанк (попытка {attempt}/{max_attempts})...")
+                    await send_fn(f"{self._mask_card(card_num)}: ⏳ банк {attempt}/{max_attempts}", True)
                 except Exception:
                     pass
 
@@ -626,10 +626,23 @@ class GosuslugiBrowserClient:
         параллельные оплаты никогда не возьмут одну и ту же карту одновременно.
         asyncio однопоточный, а между проверкой пула и .pop(0) нет await,
         поэтому гонки за карту здесь в принципе не возникает.
-        После каждой попытки вызывает send_fn(text) с результатом по карте.
+        send_fn — это send_fn(text, replace_last=False): по умолчанию добавляет
+        новую короткую строку в статус-сообщение, а с replace_last=True
+        обновляет последнюю (для промежуточного прогресса вроде подбора банка) —
+        так весь ход оплаты умещается в одно редактируемое сообщение, без спама.
+        Итоговый статус по карте — максимально короткий (эмодзи), без описания
+        причины (она всё равно есть в логах консоли).
         page передаётся явно, чтобы разные вызовы работали на разных вкладках."""
+        SHORT_STATUS = {
+            "success": "✅",
+            "declined": "❌",
+            "3ds": "🚫 3DS",
+            "unknown": "❓",
+            "error": "⚠️",
+        }
+
         if not page:
-            await send_fn("Браузер не активен.")
+            await send_fn("⚠️ браузер не активен")
             return False
 
         payment_url = page.url
@@ -637,10 +650,7 @@ class GosuslugiBrowserClient:
 
         while True:
             if not card_pool:
-                if attempt == 0:
-                    await send_fn("🚫 Свободных карт в общем пуле не осталось.")
-                else:
-                    await send_fn("🚫 Карты в общем пуле закончились, платёж не прошёл ни на одной.")
+                await send_fn("🚫 карты закончились")
                 return False
 
             card_num, expiry, cvv = card_pool.pop(0)
@@ -655,11 +665,12 @@ class GosuslugiBrowserClient:
                     await page.goto(payment_url, wait_until="load")
                     await asyncio.sleep(2)
                 except Exception as e:
-                    await send_fn(f"⚠️ Не удалось перезагрузить страницу оплаты перед картой {masked}: {e}")
+                    logger.warning("Не удалось перезагрузить страницу оплаты перед картой %s: %s", masked, e)
 
-            await send_fn(f"💳 Карта {masked}: пробую оплатить...")
+            await send_fn(f"{masked}: ⏳")
             status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
-            await send_fn(f"💳 Карта {masked}: {message}")
+            logger.info("Карта %s — статус %s: %s", masked, status, message)
+            await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", True)
 
             if status == "success":
                 return True
@@ -673,6 +684,31 @@ class GosuslugiBrowserClient:
         self.page = None
         self.context = None
         self.playwright = None
+
+
+class StatusMessage:
+    """Один пуш на весь процесс оплаты, который дальше только редактируется —
+    вместо отдельного сообщения на каждую попытку/карту (было слишком много
+    спама: одно сообщение на старт карты, другое на результат)."""
+
+    def __init__(self, title):
+        self._title = title
+        self._lines = []
+        self._message = None
+
+    async def start(self, source_message):
+        self._message = await source_message.answer(self._title)
+
+    async def push(self, text, replace_last=False):
+        if replace_last and self._lines:
+            self._lines[-1] = text
+        else:
+            self._lines.append(text)
+        body = self._title + ("\n" + "\n".join(self._lines) if self._lines else "")
+        try:
+            await self._message.edit_text(body)
+        except Exception:
+            pass  # текст не изменился / временная ошибка редактирования — не критично
 
 
 @dp.message(CommandStart())
@@ -810,18 +846,16 @@ async def process_steps(message: Message):
         pending_fines = user_data[chat_id].get("pending_fines") or [(client.page, None)]
         multi = len(pending_fines) > 1
 
-        await message.answer(
-            f"⏳ Начинаю оплату{' на ' + str(len(pending_fines)) + ' вкладках параллельно' if multi else ''}, "
-            f"карт в очереди: {len(cards)}..."
-        )
-
         async def pay_one(index, page, uin):
-            prefix = ""
-            if multi:
-                prefix = f"Штраф {index}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "") + ": "
+            title = (
+                f"💳 Штраф {index}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "")
+                if multi else "💳 Оплата"
+            )
+            status_msg = StatusMessage(title)
+            await status_msg.start(message)
 
-            async def send(text):
-                await message.answer(f"{prefix}{text}")
+            async def send(text, replace_last=False):
+                await status_msg.push(text, replace_last)
 
             await client.pay_with_cards(cards, send, page)
 
