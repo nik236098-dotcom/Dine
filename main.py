@@ -280,13 +280,21 @@ class GosuslugiBrowserClient:
             # ФССП (в отличие от обычного штрафа ГИБДД) позволяет оплатить долг
             # частями — на странице оплаты появляется ссылка "Оплатить частично".
             # Её наличие и есть признак того, что это ФССП, а не обычный штраф.
+            # ВАЖНО: если оплата открылась в НОВОЙ вкладке, страница ещё могла не
+            # дорисоваться (domcontentloaded — это только разбор HTML, React
+            # дорисовывает позже) — раньше проверка срабатывала слишком рано и
+            # ФССП не распознавался. Явно ждём появления ссылки до 5 сек, а не
+            # проверяем мгновенно.
+            partial_pay_selector = "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
             is_fssp = False
             try:
-                is_fssp = await page.locator(
-                    "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
-                ).count() > 0
+                await page.wait_for_selector(partial_pay_selector, state="visible", timeout=5000)
+                is_fssp = True
+            except PlaywrightTimeoutError:
+                is_fssp = False
             except Exception:
                 pass
+            logger.info("Определение ФССП: is_fssp=%s, страница=%s", is_fssp, page.url)
 
             if is_fssp:
                 amount_line = f" Сумма долга: {amount_str} ₽." if amount_str else ""
