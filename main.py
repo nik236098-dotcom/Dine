@@ -660,7 +660,7 @@ class GosuslugiBrowserClient:
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
             "declined": "❌",
-            "3ds": "🚫 3DS",
+            "3ds": "❌",
             "unknown": "❓",
             "error": "⚠️",
         }
