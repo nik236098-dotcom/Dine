@@ -314,9 +314,18 @@ class GosuslugiBrowserClient:
         """На странице ФССП жмёт 'Оплатить частично', вводит сумму в открывшейся
         модалке и жмёт 'Сохранить'. Возвращает (успех, сообщение)."""
         try:
-            partial_link = page.locator(
-                "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
-            ).first
+            partial_link_selector = "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
+            partial_link_count = await page.locator(partial_link_selector).count()
+            logger.info("ФССП: ссылок 'Оплатить частично' найдено: %d", partial_link_count)
+            if partial_link_count == 0:
+                # Значит либо это уже не та страница (не перезагрузилась как ожидалось),
+                # либо ссылка после первого использования называется иначе.
+                await page.screenshot(path=os.path.join(BASE_DATA_DIR, "fssp_no_partial_link.png"))
+                body_text = await page.inner_text("body")
+                logger.info("ФССП: текст страницы (первые 500 симв.): %s", body_text[:500])
+                return False, "не нашёл ссылку «Оплатить частично» на странице"
+
+            partial_link = page.locator(partial_link_selector).first
             await partial_link.click()
             await asyncio.sleep(1)
 
@@ -326,16 +335,41 @@ class GosuslugiBrowserClient:
                 "input[type='text'], input[type='number'], input[inputmode='decimal'], input:not([type])"
             )
             await page.wait_for_selector(amount_input_selector, state="visible", timeout=8000)
+            inputs_count = await page.locator(amount_input_selector).count()
             amount_input = page.locator(amount_input_selector).last
             await amount_input.click()
             await amount_input.fill(str(amount_str))
             await asyncio.sleep(0.5)
 
+            # Проверяем, что реально осталось в поле после fill() — на некоторых
+            # React-формах программный fill() не всегда "приживается".
+            actual_value = await amount_input.input_value()
+            logger.info(
+                "ФССП: подходящих input на странице %d, взяли последний, "
+                "хотели вписать %s, реально в поле: %s",
+                inputs_count, amount_str, actual_value
+            )
+            try:
+                await page.screenshot(path=os.path.join(BASE_DATA_DIR, "fssp_amount_before_save.png"))
+            except Exception:
+                pass
+
             save_btn = page.locator("button:has-text('Сохранить')").last
             await save_btn.click()
             await asyncio.sleep(1.5)
 
-            return True, f"Сумма {amount_str} ₽ сохранена."
+            # Финальная проверка: сумма на странице после сохранения должна
+            # совпасть с тем, что мы вводили — иначе сохранение не подействовало.
+            try:
+                body_text_after = await page.inner_text("body")
+                logger.info(
+                    "ФССП: сумма %s встречается в тексте после сохранения: %s раз",
+                    amount_str, body_text_after.count(str(amount_str))
+                )
+            except Exception:
+                pass
+
+            return True, f"Сумма {amount_str} ₽ сохранена (в поле было: {actual_value})."
         except Exception as e:
             try:
                 await page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_fssp_amount.png"))
@@ -763,11 +797,13 @@ class GosuslugiBrowserClient:
                 # только один раз в самом начале.
                 if is_fssp and amount_str:
                     ok, fssp_msg = await self.set_partial_payment_amount(page, amount_str)
-                    if not ok:
+                    if ok:
+                        logger.info("ФССП: сумма переустановлена перед картой %s: %s", masked, fssp_msg)
+                    else:
                         logger.warning(
                             "Не удалось повторно задать сумму ФССП перед картой %s: %s", masked, fssp_msg
                         )
-                        await send_fn(f"⚠️ не удалось выставить сумму {amount_str} ₽ повторно")
+                        await send_fn(f"⚠️ не удалось выставить сумму {amount_str} ₽ повторно ({fssp_msg})")
 
             await send_fn(f"{masked}: ⏳")
             status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
