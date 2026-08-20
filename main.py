@@ -318,6 +318,12 @@ class GosuslugiBrowserClient:
             except Exception:
                 pass
             current_url = page.url if page else "?"
+            # Сессия иногда слетает не сразу, а прямо во время ожидания поля —
+            # сайт редиректит на esia.gosuslugi.ru/login с задержкой, и тогда
+            # ошибка выглядит как обычный Timeout, хотя причина понятна по URL.
+            if "login" in current_url or "esia" in current_url:
+                self.logged_in = False
+                return False, "⚠️ Сессия слетела прямо во время поиска. Авторизуйтесь заново через /login.", page, False
             return False, f"Ошибка поиска: {str(e)} (страница: {current_url})", page, False
 
     async def _wait_for_page_content(self, page, min_length=50, max_wait=60):
