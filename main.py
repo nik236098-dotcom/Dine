@@ -283,8 +283,10 @@ class GosuslugiBrowserClient:
             # ВАЖНО: если оплата открылась в НОВОЙ вкладке, страница ещё могла не
             # дорисоваться (domcontentloaded — это только разбор HTML, React
             # дорисовывает позже) — раньше проверка срабатывала слишком рано и
-            # ФССП не распознавался. Явно ждём появления ссылки до 5 сек, а не
-            # проверяем мгновенно.
+            # ФССП не распознавался. Сначала ждём хоть какого-то контента (не
+            # пустую загрузку/спиннер), потом уже проверяем саму ссылку.
+            await self._wait_for_page_content(page)
+
             partial_pay_selector = "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
             is_fssp = False
             try:
@@ -318,13 +320,34 @@ class GosuslugiBrowserClient:
             current_url = page.url if page else "?"
             return False, f"Ошибка поиска: {str(e)} (страница: {current_url})", page, False
 
+    async def _wait_for_page_content(self, page, min_length=50, max_wait=60):
+        """Ждёт, пока на странице появится хоть какой-то текст, вместо того
+        чтобы сдаваться по фиксированному таймауту, пока идёт пустая загрузка/
+        крутится спиннер. Как только текст есть — можно уже нормально искать
+        конкретные элементы с обычным (коротким) таймаутом."""
+        waited = 0
+        step = 1
+        while waited < max_wait:
+            try:
+                text = await page.inner_text("body")
+            except Exception:
+                text = ""
+            if len(text.strip()) >= min_length:
+                return True
+            await asyncio.sleep(step)
+            waited += step
+        logger.warning("Страница так и не показала контент за %d сек (%s)", max_wait, page.url)
+        return False
+
     async def set_partial_payment_amount(self, page, amount_str):
         """На странице ФССП жмёт 'Оплатить частично', вводит сумму в открывшейся
         модалке и жмёт 'Сохранить'. Возвращает (успех, сообщение)."""
         try:
-            # Мгновенная проверка count() ловила страницу ещё в состоянии загрузки
-            # (SPA рендерится дольше, чем короткая пауза после reload) — ждём
-            # появления ссылки явно, а не проверяем сразу.
+            # Сначала ждём, пока страница вообще покажет какой-то текст (не
+            # пустая загрузка/спиннер) — без этого короткий таймаут ниже мог
+            # истечь, пока страница ещё честно грузится.
+            await self._wait_for_page_content(page)
+
             partial_link_selector = "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
             try:
                 await page.wait_for_selector(partial_link_selector, state="visible", timeout=10000)
