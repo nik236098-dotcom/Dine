@@ -691,7 +691,7 @@ class GosuslugiBrowserClient:
         digits = re.sub(r"\D", "", card_num)
         return f"•••• {digits[-4:]}" if len(digits) >= 4 else "••••"
 
-    async def pay_with_cards(self, card_pool, send_fn, page):
+    async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -741,6 +741,17 @@ class GosuslugiBrowserClient:
                     await asyncio.sleep(2)
                 except Exception as e:
                     logger.warning("Не удалось перезагрузить страницу оплаты перед картой %s: %s", masked, e)
+
+                # У ФССП перезагрузка страницы сбрасывает частичную сумму обратно
+                # на полную — задаём её заново перед каждой новой картой, а не
+                # только один раз в самом начале.
+                if is_fssp and amount_str:
+                    ok, fssp_msg = await self.set_partial_payment_amount(page, amount_str)
+                    if not ok:
+                        logger.warning(
+                            "Не удалось повторно задать сумму ФССП перед картой %s: %s", masked, fssp_msg
+                        )
+                        await send_fn(f"⚠️ не удалось выставить сумму {amount_str} ₽ повторно")
 
             await send_fn(f"{masked}: ⏳")
             status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
@@ -942,7 +953,7 @@ async def process_steps(message: Message):
 
         # Обычные штрафы идут сразу к вводу карты, а ФССП — сначала нужно
         # спросить сумму частичной оплаты и задать её на сайте.
-        ready_fines = [(page, uin) for success, page, uin, is_fssp in results if success and not is_fssp]
+        ready_fines = [(page, uin, False, None) for success, page, uin, is_fssp in results if success and not is_fssp]
         fssp_queue = [(page, uin) for success, page, uin, is_fssp in results if success and is_fssp]
 
         if not ready_fines and not fssp_queue:
@@ -969,7 +980,7 @@ async def process_steps(message: Message):
         await message.answer(res_msg if ok else f"❌ {res_msg}")
 
         if ok:
-            user_data[chat_id].setdefault("pending_fines", []).append((page, uin))
+            user_data[chat_id].setdefault("pending_fines", []).append((page, uin, True, cleaned))
 
         if fssp_queue:
             next_uin = fssp_queue[0][1]
@@ -999,10 +1010,10 @@ async def process_steps(message: Message):
             await message.answer("❌ Не нашёл ни одной карты. Введите: номер|дата|cvv")
             return
 
-        pending_fines = user_data[chat_id].get("pending_fines") or [(client.page, None)]
+        pending_fines = user_data[chat_id].get("pending_fines") or [(client.page, None, False, None)]
         multi = len(pending_fines) > 1
 
-        async def pay_one(index, page, uin):
+        async def pay_one(index, page, uin, is_fssp, amount_str):
             title = (
                 f"💳 Штраф {index}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "")
                 if multi else "💳 Оплата"
@@ -1013,10 +1024,11 @@ async def process_steps(message: Message):
             async def send(text, replace_last=False):
                 await status_msg.push(text, replace_last)
 
-            await client.pay_with_cards(cards, send, page)
+            await client.pay_with_cards(cards, send, page, is_fssp=is_fssp, amount_str=amount_str)
 
         await asyncio.gather(*[
-            pay_one(i + 1, page, uin) for i, (page, uin) in enumerate(pending_fines)
+            pay_one(i + 1, page, uin, is_fssp, amount_str)
+            for i, (page, uin, is_fssp, amount_str) in enumerate(pending_fines)
         ])
 
         user_data[chat_id].pop("pending_fines", None)
