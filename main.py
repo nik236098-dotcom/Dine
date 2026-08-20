@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import pyotp  # pip install pyotp — генерация TOTP-кодов из секретного ключа
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
@@ -26,6 +28,29 @@ USER_PROFILE_DIR = os.path.join(BASE_DATA_DIR, "gosuslugi_profile")
 # Страница прямого поиска и оплаты штрафа/квитанции по УИН.
 QUITTANCE_URL = "https://www.gosuslugi.ru/pay/quittance"
 
+# Секретные ключи TOTP хранятся отдельным локальным файлом (папка .bot_data
+# в .gitignore, наружу не уходит) — чтобы не спрашивать /totp заново после
+# каждого перезапуска бота.
+TOTP_SECRETS_FILE = os.path.join(BASE_DATA_DIR, "totp_secrets.json")
+
+
+def load_totp_secrets():
+    try:
+        with open(TOTP_SECRETS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_totp_secret(chat_id, secret):
+    secrets = load_totp_secrets()
+    secrets[str(chat_id)] = secret
+    with open(TOTP_SECRETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(secrets, f)
+
+
+totp_secrets = load_totp_secrets()  # chat_id (str) -> секрет, в памяти на весь процесс
+
 
 class GosuslugiBrowserClient:
     def __init__(self):
@@ -34,6 +59,7 @@ class GosuslugiBrowserClient:
         self.context = None
         self.page = None
         self.logged_in = False
+        self.totp_secret = None  # если задан — код на шаге входа вводится автоматически
 
     async def _launch_browser(self):
         """Поднимает постоянный (persisted) браузерный профиль, если он ещё не запущен.
@@ -114,6 +140,21 @@ class GosuslugiBrowserClient:
             await password_field.fill(password)
 
             await self.page.click("button[type='submit'], button.plain-button")
+
+            if self.totp_secret:
+                # Ключ TOTP задан — вводим код из приложения автоматически,
+                # не спрашивая пользователя в Telegram вообще.
+                try:
+                    await asyncio.sleep(2)
+                    code = pyotp.TOTP(self.totp_secret).now()
+                    success, msg = await self.enter_sms_code(code)
+                    if success:
+                        return "auto_logged_in", "✅ Авторизация успешна (TOTP-код введён автоматически)."
+                    return False, f"❌ Автоматический ввод TOTP не сработал: {msg}"
+                except Exception as e:
+                    await self.close()
+                    return False, f"❌ Ошибка автоматического TOTP: {e}"
+
             return True, "Данные заполнены! Введите СМС-код из телефона в чат бота:"
         except Exception as e:
             await self.close()
@@ -122,8 +163,14 @@ class GosuslugiBrowserClient:
     async def enter_sms_code(self, code):
         try:
             if not self.page: return False, "Сессия не найдена. Начните сначала через /login."
-            await self.page.wait_for_selector("input[type='tel']", timeout=15000)
-            await self.page.fill("input[type='tel']", code)
+            # Поле ввода кода может быть и под СМС, и под TOTP из приложения —
+            # набор атрибутов на всякий случай пошире, чем просто type='tel'.
+            code_selector = (
+                "input[type='tel'], input[inputmode='numeric'], "
+                "input[autocomplete='one-time-code'], input[name*='otp' i], input[name*='code' i]"
+            )
+            await self.page.wait_for_selector(code_selector, timeout=15000)
+            await self.page.fill(code_selector, code)
 
             # СТАРЫЙ БАГ: страница входа сама находится на *.gosuslugi.ru
             # (обычно esia.gosuslugi.ru), поэтому wait_for_url с таким широким
@@ -890,6 +937,15 @@ class GosuslugiBrowserClient:
         self.playwright = None
 
 
+def create_client(chat_id):
+    """Новый GosuslugiBrowserClient с уже подставленным TOTP-секретом (если
+    он был сохранён через /totp) — чтобы не повторять эту привязку в каждом
+    месте, где создаётся клиент."""
+    client = GosuslugiBrowserClient()
+    client.totp_secret = totp_secrets.get(str(chat_id))
+    return client
+
+
 class StatusMessage:
     """Один пуш на весь процесс оплаты, который дальше только редактируется —
     вместо отдельного сообщения на каждую попытку/карту (было слишком много
@@ -929,8 +985,41 @@ async def start(message: Message):
         "Команды:\n"
         "/login - Авторизоваться\n"
         "/pay - Проверить штраф по УИН\n"
-        "/stop - Остановить текущий процесс (браузер остаётся открытым)"
+        "/stop - Остановить текущий процесс (браузер остаётся открытым)\n"
+        "/totp <ключ> - Сохранить TOTP-ключ, чтобы /login сам вводил код из приложения"
     )
+
+
+@dp.message(Command("totp"))
+async def totp_cmd(message: Message):
+    chat_id = message.chat.id
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "Использование: /totp <секретный ключ>\n"
+            "Это тот же ключ (base32), который вы бы вставили в Google Authenticator "
+            "при включении входа по приложению на Госуслугах.\n"
+            "После сохранения /login будет вводить код из приложения сам, без ручного ввода."
+        )
+        return
+
+    secret = parts[1].strip().replace(" ", "")
+    try:
+        # Простая проверка, что это вообще валидный TOTP-секрет — сразу
+        # пробуем сгенерировать код, а не ждём первого реального /login.
+        pyotp.TOTP(secret).now()
+    except Exception as e:
+        await message.answer(f"❌ Похоже, ключ невалидный: {e}")
+        return
+
+    totp_secrets[str(chat_id)] = secret
+    save_totp_secret(chat_id, secret)
+
+    client = user_data.get(chat_id, {}).get("client")
+    if client:
+        client.totp_secret = secret
+
+    await message.answer("✅ TOTP-ключ сохранён. Дальше /login будет вводить код из приложения автоматически.")
 
 
 @dp.message(Command("login"))
@@ -939,7 +1028,7 @@ async def login_cmd(message: Message):
     user_state[chat_id] = "waiting_username"
     if chat_id in user_data and "client" in user_data[chat_id]:
         await user_data[chat_id]["client"].close()
-    user_data[chat_id] = {"client": GosuslugiBrowserClient()}
+    user_data[chat_id] = {"client": create_client(chat_id)}
     await message.answer("Введите ваш логин от Госуслуг (телефон, почта или СНИЛС):")
 
 
@@ -978,7 +1067,7 @@ async def pay_cmd(message: Message):
         # После перезапуска бота клиента в памяти нет, но браузерный профиль
         # на диске (USER_PROFILE_DIR) мог сохранить рабочую сессию Госуслуг —
         # проверяем её, вместо того чтобы сразу гнать пользователя на /login.
-        client = GosuslugiBrowserClient()
+        client = create_client(chat_id)
         user_data[chat_id] = {"client": client}
 
     if not client.logged_in:
@@ -1015,7 +1104,7 @@ async def process_steps(message: Message):
         await message.answer("⏳ Запускаю автоматический браузер на ПК и ввожу ваши данные...")
         status, res_msg = await client.start_auth(user_data[chat_id]["username"], user_data[chat_id]["password"])
         await message.answer(res_msg)
-        if status == "already_logged_in":
+        if status in ("already_logged_in", "auto_logged_in"):
             user_state[chat_id] = "ready_for_pay"
         elif status is False:
             user_state[chat_id] = None
