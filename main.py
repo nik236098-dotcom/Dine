@@ -64,10 +64,16 @@ class GosuslugiBrowserClient:
         через /login при каждом перезапуске бота, если сессия ещё жива."""
         try:
             await self._launch_browser()
-            await self.page.goto("https://gosuslugi.ru", wait_until="domcontentloaded")
+            # ВАЖНО: раньше проверка ходила на публичную главную gosuslugi.ru —
+            # она не требует входа и не редиректит анонимного пользователя на
+            # логин, поэтому почти всегда выглядела как "сессия активна", даже
+            # если сессия реально истекла. Проверяем на защищённой странице
+            # (той же, куда падает /pay), которая честно редиректит на esia,
+            # если сессии нет.
+            await self.page.goto(QUITTANCE_URL, wait_until="load")
             await asyncio.sleep(2)
 
-            if "login" not in self.page.url and await self.page.locator("input#login").count() == 0:
+            if "login" not in self.page.url and "esia" not in self.page.url:
                 self.logged_in = True
                 return "already_logged_in", "✨ Сессия активна! Можно проверять штраф."
 
@@ -81,10 +87,16 @@ class GosuslugiBrowserClient:
         try:
             await self._launch_browser()
 
-            await self.page.goto("https://gosuslugi.ru", wait_until="domcontentloaded")
+            # ВАЖНО: раньше проверка ходила на публичную главную gosuslugi.ru —
+            # она не требует входа и не редиректит анонимного пользователя на
+            # логин, поэтому почти всегда выглядела как "сессия активна", даже
+            # если сессия реально истекла. Проверяем на защищённой странице
+            # (той же, куда падает /pay), которая честно редиректит на esia,
+            # если сессии нет.
+            await self.page.goto(QUITTANCE_URL, wait_until="load")
             await asyncio.sleep(2)
 
-            if "login" not in self.page.url and await self.page.locator("input#login").count() == 0:
+            if "login" not in self.page.url and "esia" not in self.page.url:
                 self.logged_in = True
                 return "already_logged_in", "✨ Сессия активна! Можно сразу проверять штраф через /pay."
 
