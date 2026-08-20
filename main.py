@@ -5,6 +5,7 @@ import os
 import re
 import pyotp  # pip install pyotp — генерация TOTP-кодов из секретного ключа
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -14,7 +15,16 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = "8839226959:AAEnAfN1Hs3OOqmCPui0sSaz6MjCNsrR6Rc"
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# На российских серверах/датацентрах Telegram часто режут — если нужно,
+# задайте прокси именно для соединения с Telegram (не для Госуслуг/браузера)
+# через переменную окружения, например:
+#   export TELEGRAM_PROXY=socks5://127.0.0.1:40000
+# (порт — тот, что настроен в Cloudflare WARP в режиме proxy). Локально на
+# ПК, где Telegram не блокируется, переменную просто не задавайте.
+TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY")
+bot_session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None
+
+bot = Bot(token=TELEGRAM_BOT_TOKEN, session=bot_session)
 dp = Dispatcher()
 
 user_state = {}
