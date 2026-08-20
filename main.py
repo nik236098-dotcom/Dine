@@ -947,13 +947,24 @@ class GosuslugiBrowserClient:
         self.playwright = None
 
 
-def create_client(chat_id):
-    """Новый GosuslugiBrowserClient с уже подставленным TOTP-секретом (если
-    он был сохранён через /totp) — чтобы не повторять эту привязку в каждом
-    месте, где создаётся клиент."""
-    client = GosuslugiBrowserClient()
-    client.totp_secret = totp_secrets.get(str(chat_id))
-    return client
+# Один общий браузер/логин на всех, кто пишет боту — на Госуслугах всё равно
+# только один аккаунт и один профиль (USER_PROFILE_DIR общий на всех), поэтому
+# отдельный GosuslugiBrowserClient на каждый chat_id только вредил: второй
+# chat_id (или повторный /pay из того же чата) пытался поднять ещё один
+# launch_persistent_context на уже занятом профиле и падал, открывая пустую
+# вкладку. Теперь клиент один, а каждый /pay просто открывает СВОЮ отдельную
+# вкладку в этом общем браузере — вкладки не пересекаются между вызовами.
+shared_client = GosuslugiBrowserClient()
+
+
+async def open_new_tab(client):
+    """Открывает отдельную вкладку в уже поднятом общем браузере — используется
+    вместо client.page, чтобы параллельные/повторные /pay не дрались за одну
+    и ту же вкладку."""
+    page = await client.context.new_page()
+    await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    page.set_default_timeout(40000)
+    return page
 
 
 class StatusMessage:
@@ -996,6 +1007,7 @@ async def start(message: Message):
         "/login - Авторизоваться\n"
         "/pay - Проверить штраф по УИН\n"
         "/stop - Остановить текущий процесс (браузер остаётся открытым)\n"
+        "/close - Закрыть все вкладки и сам браузер\n"
         "/totp <ключ> - Сохранить TOTP-ключ, чтобы /login сам вводил код из приложения"
     )
 
@@ -1024,10 +1036,7 @@ async def totp_cmd(message: Message):
 
     totp_secrets[str(chat_id)] = secret
     save_totp_secret(chat_id, secret)
-
-    client = user_data.get(chat_id, {}).get("client")
-    if client:
-        client.totp_secret = secret
+    shared_client.totp_secret = secret
 
     await message.answer("✅ TOTP-ключ сохранён. Дальше /login будет вводить код из приложения автоматически.")
 
@@ -1036,9 +1045,10 @@ async def totp_cmd(message: Message):
 async def login_cmd(message: Message):
     chat_id = message.chat.id
     user_state[chat_id] = "waiting_username"
-    if chat_id in user_data and "client" in user_data[chat_id]:
-        await user_data[chat_id]["client"].close()
-    user_data[chat_id] = {"client": create_client(chat_id)}
+    if shared_client.page:
+        await shared_client.close()
+    shared_client.totp_secret = totp_secrets.get(str(chat_id))
+    user_data[chat_id] = {}
     await message.answer("Введите ваш логин от Госуслуг (телефон, почта или СНИЛС):")
 
 
@@ -1059,8 +1069,7 @@ async def stop_cmd(message: Message):
     if chat_id in user_data:
         user_data[chat_id].pop("pending_fines", None)
 
-    client = user_data.get(chat_id, {}).get("client")
-    user_state[chat_id] = "ready_for_pay" if client and client.logged_in else None
+    user_state[chat_id] = "ready_for_pay" if shared_client.logged_in else None
 
     if was_running:
         await message.answer("🛑 Процесс остановлен. Браузер и сессия входа не тронуты — можно продолжать через /pay.")
@@ -1068,25 +1077,44 @@ async def stop_cmd(message: Message):
         await message.answer("🛑 Активных процессов не было.")
 
 
+@dp.message(Command("close"))
+async def close_cmd(message: Message):
+    chat_id = message.chat.id
+
+    # В отличие от /stop — закрывает сам браузер целиком со всеми вкладками
+    # (и сбрасывает сессию входа), а не только останавливает текущий процесс.
+    for task in list(active_tasks.values()):
+        if task and not task.done():
+            task.cancel()
+    active_tasks.clear()
+
+    await shared_client.close()
+
+    for cid in list(user_data.keys()):
+        user_data[cid].pop("pending_fines", None)
+        user_data[cid].pop("fssp_queue", None)
+    for cid in list(user_state.keys()):
+        user_state[cid] = None
+
+    await message.answer("🧹 Браузер и все вкладки закрыты. Для продолжения — /login или /pay.")
+
+
 @dp.message(Command("pay"))
 async def pay_cmd(message: Message):
     chat_id = message.chat.id
-    client = user_data.get(chat_id, {}).get("client")
+    client = shared_client
 
-    if not client:
+    if not client.logged_in:
         # После перезапуска бота клиента в памяти нет, но браузерный профиль
         # на диске (USER_PROFILE_DIR) мог сохранить рабочую сессию Госуслуг —
         # проверяем её, вместо того чтобы сразу гнать пользователя на /login.
-        client = create_client(chat_id)
-        user_data[chat_id] = {"client": client}
-
-    if not client.logged_in:
         await message.answer("⏳ Проверяю сохранённую сессию Госуслуг...")
         status, res_msg = await client.ensure_logged_in()
         if status != "already_logged_in":
             await message.answer(res_msg + "\n\nИспользуйте команду /login")
             return
 
+    user_data[chat_id] = {}
     user_state[chat_id] = "waiting_uin"
     await message.answer(
         "Пожалуйста, введите УИН штрафа (20 или 25 цифр).\n"
@@ -1102,7 +1130,7 @@ async def process_steps(message: Message):
     # это долгий поиск/оплата на нескольких вкладках.
     active_tasks[chat_id] = asyncio.current_task()
     state = user_state.get(chat_id)
-    client = user_data.get(chat_id, {}).get("client")
+    client = shared_client
 
     if state == "waiting_username":
         user_data[chat_id]["username"] = message.text
@@ -1142,14 +1170,10 @@ async def process_steps(message: Message):
 
         await message.answer(f"⏳ Проверяю {len(uins)} штраф(ов){' параллельно' if len(uins) > 1 else ''}...")
 
-        # Первый УИН — на уже открытой вкладке клиента, для второго открываем
-        # новую вкладку в том же контексте (куки/сессия входа общие).
-        pages = [client.page]
-        for _ in range(len(uins) - 1):
-            new_tab = await client.context.new_page()
-            await new_tab.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            new_tab.set_default_timeout(40000)
-            pages.append(new_tab)
+        # Каждый УИН — на своей отдельной новой вкладке общего браузера (а не на
+        # client.page): так повторный/параллельный /pay из этого же или другого
+        # чата не пересекается с вкладками, уже занятыми другим вызовом.
+        pages = [await open_new_tab(client) for _ in uins]
 
         async def check_one(index, uin, page):
             success, res_msg, result_page, is_fssp = await client.check_penalty_by_uin(uin, page)
@@ -1220,7 +1244,9 @@ async def process_steps(message: Message):
             await message.answer("❌ Не нашёл ни одной карты. Введите: номер|дата|cvv")
             return
 
-        pending_fines = user_data[chat_id].get("pending_fines") or [(client.page, None, False, None)]
+        pending_fines = user_data[chat_id].get("pending_fines")
+        if not pending_fines:
+            pending_fines = [(await open_new_tab(client), None, False, None)]
         multi = len(pending_fines) > 1
         total_cards_count = len(cards)  # фиксируем ДО того, как пул начнут разбирать
 
