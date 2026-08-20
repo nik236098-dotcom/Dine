@@ -162,7 +162,7 @@ class GosuslugiBrowserClient:
         таких проверок параллельно на разных вкладках одного браузера."""
         try:
             if not page or not self.logged_in:
-                return False, "Вы не авторизованы. Введите /login.", page
+                return False, "Вы не авторизованы. Введите /login.", page, False
 
             # БАГ БЫЛ ЗДЕСЬ: раньше переход выполнялся на "https://gosuslugi.ru" (главная),
             # а не на страницу поиска квитанций — на главной нет поля ввода УИН,
@@ -176,7 +176,7 @@ class GosuslugiBrowserClient:
             await asyncio.sleep(2)
             if "login" in page.url or "esia" in page.url:
                 self.logged_in = False
-                return False, "⚠️ Сессия слетела — сайт вернул вас на страницу входа. Авторизуйтесь заново через /login.", page
+                return False, "⚠️ Сессия слетела — сайт вернул вас на страницу входа. Авторизуйтесь заново через /login.", page, False
 
             uin_selector = (
                 "input[name*='uin' i], input[id*='uin' i], "
@@ -246,7 +246,7 @@ class GosuslugiBrowserClient:
                     logger.warning("Не удалось прочитать текст страницы для диагностики: %s", diag_err)
 
                 if await page.locator(not_found_selector).count() > 0:
-                    return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно.", page
+                    return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно.", page, False
                 raise PlaywrightTimeoutError("сумма штрафа не появилась ни на странице, ни во фреймах")
 
             # Достаём сумму штрафа для вывода в сообщении пользователю.
@@ -254,7 +254,7 @@ class GosuslugiBrowserClient:
             amount_str = None
             try:
                 body_text = await page.inner_text("body")
-                amount_match = re.search(r"(\d[\d \s]*\d)\s*Р(?![а-яёА-ЯЁ])", body_text)
+                amount_match = re.search(r"(\d[\d \s]*\d)\s*[Р₽](?![а-яёА-ЯЁ])", body_text)
                 if amount_match:
                     amount_str = amount_match.group(1).replace(" ", " ").strip()
             except Exception:
@@ -277,12 +277,30 @@ class GosuslugiBrowserClient:
                 # Новая вкладка не появилась — форма оплаты, скорее всего, на этой же странице
                 await asyncio.sleep(4)
 
+            # ФССП (в отличие от обычного штрафа ГИБДД) позволяет оплатить долг
+            # частями — на странице оплаты появляется ссылка "Оплатить частично".
+            # Её наличие и есть признак того, что это ФССП, а не обычный штраф.
+            is_fssp = False
+            try:
+                is_fssp = await page.locator(
+                    "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
+                ).count() > 0
+            except Exception:
+                pass
+
+            if is_fssp:
+                amount_line = f" Сумма долга: {amount_str} ₽." if amount_str else ""
+                return True, (
+                    f"✅ ФССП найдено!{amount_line} Доступна частичная оплата.\n"
+                    "Введите сумму к оплате (числом, в рублях):"
+                ), page, True
+
             amount_line = f" К оплате: {amount_str} ₽." if amount_str else ""
             return True, (
                 f"✅ Штраф найден!{amount_line} Введите данные карты в формате: номер|дата|cvv\n"
                 "Можно несколько карт — каждую с новой строки, бот будет пробовать их по очереди, "
                 "пока платёж не пройдёт."
-            ), page
+            ), page, False
         except Exception as e:
             try:
                 if page:
@@ -290,7 +308,40 @@ class GosuslugiBrowserClient:
             except Exception:
                 pass
             current_url = page.url if page else "?"
-            return False, f"Ошибка поиска: {str(e)} (страница: {current_url})", page
+            return False, f"Ошибка поиска: {str(e)} (страница: {current_url})", page, False
+
+    async def set_partial_payment_amount(self, page, amount_str):
+        """На странице ФССП жмёт 'Оплатить частично', вводит сумму в открывшейся
+        модалке и жмёт 'Сохранить'. Возвращает (успех, сообщение)."""
+        try:
+            partial_link = page.locator(
+                "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
+            ).first
+            await partial_link.click()
+            await asyncio.sleep(1)
+
+            # Модалка дорисовывается в конец DOM — берём ПОСЛЕДНЕЕ подходящее
+            # поле на странице (а не первое, чтобы не задеть поля карты выше).
+            amount_input_selector = (
+                "input[type='text'], input[type='number'], input[inputmode='decimal'], input:not([type])"
+            )
+            await page.wait_for_selector(amount_input_selector, state="visible", timeout=8000)
+            amount_input = page.locator(amount_input_selector).last
+            await amount_input.click()
+            await amount_input.fill(str(amount_str))
+            await asyncio.sleep(0.5)
+
+            save_btn = page.locator("button:has-text('Сохранить')").last
+            await save_btn.click()
+            await asyncio.sleep(1.5)
+
+            return True, f"Сумма {amount_str} ₽ сохранена."
+        except Exception as e:
+            try:
+                await page.screenshot(path=os.path.join(BASE_DATA_DIR, "error_fssp_amount.png"))
+            except Exception:
+                pass
+            return False, f"Не удалось задать сумму частичной оплаты: {e}"
 
     async def _wait_for_gazprombank(self, target, card_selector, card_num, send_fn=None, max_attempts=60):
         """Госуслуги выбирают банк-эквайер для платежа заново при каждом новом
@@ -880,23 +931,55 @@ async def process_steps(message: Message):
             pages.append(new_tab)
 
         async def check_one(index, uin, page):
-            success, res_msg, result_page = await client.check_penalty_by_uin(uin, page)
+            success, res_msg, result_page, is_fssp = await client.check_penalty_by_uin(uin, page)
             prefix = f"Штраф {index}/{len(uins)} (УИН {uin}): " if len(uins) > 1 else ""
             await message.answer(f"{prefix}{res_msg}")
-            return success, result_page, uin
+            return success, result_page, uin, is_fssp
 
         results = await asyncio.gather(*[
             check_one(i + 1, uin, pages[i]) for i, uin in enumerate(uins)
         ])
 
-        found_fines = [(page, uin) for success, page, uin in results if success]
+        # Обычные штрафы идут сразу к вводу карты, а ФССП — сначала нужно
+        # спросить сумму частичной оплаты и задать её на сайте.
+        ready_fines = [(page, uin) for success, page, uin, is_fssp in results if success and not is_fssp]
+        fssp_queue = [(page, uin) for success, page, uin, is_fssp in results if success and is_fssp]
 
-        if not found_fines:
+        if not ready_fines and not fssp_queue:
             user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
             return
 
-        user_data[chat_id]["pending_fines"] = found_fines
-        user_state[chat_id] = "waiting_card_info"
+        user_data[chat_id]["pending_fines"] = ready_fines
+        user_data[chat_id]["fssp_queue"] = fssp_queue
+        user_state[chat_id] = "waiting_fssp_amount" if fssp_queue else "waiting_card_info"
+    elif state == "waiting_fssp_amount":
+        cleaned = re.sub(r"[^\d.]", "", message.text.strip().replace(",", "."))
+        if not cleaned:
+            await message.answer("❌ Введите сумму числом, например: 2250")
+            return
+
+        fssp_queue = user_data[chat_id].get("fssp_queue") or []
+        if not fssp_queue:
+            user_state[chat_id] = "waiting_card_info"
+            return
+
+        page, uin = fssp_queue.pop(0)
+        await message.answer(f"⏳ Задаю сумму {cleaned} ₽ для ФССП (УИН {uin})...")
+        ok, res_msg = await client.set_partial_payment_amount(page, cleaned)
+        await message.answer(res_msg if ok else f"❌ {res_msg}")
+
+        if ok:
+            user_data[chat_id].setdefault("pending_fines", []).append((page, uin))
+
+        if fssp_queue:
+            next_uin = fssp_queue[0][1]
+            await message.answer(f"Введите сумму к оплате для следующего ФССП (УИН {next_uin}):")
+        else:
+            user_data[chat_id].pop("fssp_queue", None)
+            if user_data[chat_id].get("pending_fines"):
+                user_state[chat_id] = "waiting_card_info"
+            else:
+                user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
     elif state == "waiting_card_info":
         # Можно ввести несколько карт — каждую с новой строки в формате номер|дата|cvv.
         # Бот пробует их по очереди и останавливается на первой успешной оплате.
