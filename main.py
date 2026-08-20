@@ -691,7 +691,8 @@ class GosuslugiBrowserClient:
         digits = re.sub(r"\D", "", card_num)
         return f"•••• {digits[-4:]}" if len(digits) >= 4 else "••••"
 
-    async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None):
+    async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None,
+                              total_cards=None, set_progress_fn=None):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -706,7 +707,11 @@ class GosuslugiBrowserClient:
         так весь ход оплаты умещается в одно редактируемое сообщение, без спама.
         Итоговый статус по карте — максимально короткий (эмодзи), без описания
         причины (она всё равно есть в логах консоли).
-        page передаётся явно, чтобы разные вызовы работали на разных вкладках."""
+        page передаётся явно, чтобы разные вызовы работали на разных вкладках.
+        total_cards — исходное количество карт в пуле (до всех .pop), нужно
+        только для счётчика "N/M". set_progress_fn(current, total), если
+        передан, вызывается перед каждой попыткой — им можно, например,
+        обновить заголовок статус-сообщения ("💳 Оплата 2/3")."""
         SHORT_STATUS = {
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
@@ -722,6 +727,8 @@ class GosuslugiBrowserClient:
 
         payment_url = page.url
         attempt = 0
+        if total_cards is None:
+            total_cards = len(card_pool)
 
         while True:
             if not card_pool:
@@ -731,6 +738,15 @@ class GosuslugiBrowserClient:
             card_num, expiry, cvv = card_pool.pop(0)
             attempt += 1
             masked = self._mask_card(card_num)
+
+            # card_pool общий на несколько параллельных оплат, поэтому текущий
+            # номер попытки — это сколько карт всего уже разобрано из пула
+            # (кем угодно), а не локальный счётчик именно этого вызова.
+            if set_progress_fn:
+                try:
+                    await set_progress_fn(total_cards - len(card_pool), total_cards)
+                except Exception:
+                    pass
 
             if attempt > 1:
                 # После неудачной попытки страница могла остаться в непонятном
@@ -799,16 +815,23 @@ class StatusMessage:
     async def start(self, source_message):
         self._message = await source_message.answer(self._title)
 
-    async def push(self, text, replace_last=False):
-        if replace_last and self._lines:
-            self._lines[-1] = text
-        else:
-            self._lines.append(text)
+    async def _render_and_edit(self):
         body = self._title + ("\n" + "\n".join(self._lines) if self._lines else "")
         try:
             await self._message.edit_text(body)
         except Exception:
             pass  # текст не изменился / временная ошибка редактирования — не критично
+
+    async def push(self, text, replace_last=False):
+        if replace_last and self._lines:
+            self._lines[-1] = text
+        else:
+            self._lines.append(text)
+        await self._render_and_edit()
+
+    async def set_title(self, title):
+        self._title = title
+        await self._render_and_edit()
 
 
 @dp.message(CommandStart())
@@ -1012,19 +1035,26 @@ async def process_steps(message: Message):
 
         pending_fines = user_data[chat_id].get("pending_fines") or [(client.page, None, False, None)]
         multi = len(pending_fines) > 1
+        total_cards_count = len(cards)  # фиксируем ДО того, как пул начнут разбирать
 
         async def pay_one(index, page, uin, is_fssp, amount_str):
-            title = (
+            base_title = (
                 f"💳 Штраф {index}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "")
                 if multi else "💳 Оплата"
             )
-            status_msg = StatusMessage(title)
+            status_msg = StatusMessage(base_title)
             await status_msg.start(message)
 
             async def send(text, replace_last=False):
                 await status_msg.push(text, replace_last)
 
-            await client.pay_with_cards(cards, send, page, is_fssp=is_fssp, amount_str=amount_str)
+            async def set_progress(current, total):
+                await status_msg.set_title(f"{base_title} {current}/{total}")
+
+            await client.pay_with_cards(
+                cards, send, page, is_fssp=is_fssp, amount_str=amount_str,
+                total_cards=total_cards_count, set_progress_fn=set_progress,
+            )
 
         await asyncio.gather(*[
             pay_one(i + 1, page, uin, is_fssp, amount_str)
