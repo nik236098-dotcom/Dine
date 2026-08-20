@@ -322,10 +322,13 @@ class GosuslugiBrowserClient:
         """На странице ФССП жмёт 'Оплатить частично', вводит сумму в открывшейся
         модалке и жмёт 'Сохранить'. Возвращает (успех, сообщение)."""
         try:
+            # Мгновенная проверка count() ловила страницу ещё в состоянии загрузки
+            # (SPA рендерится дольше, чем короткая пауза после reload) — ждём
+            # появления ссылки явно, а не проверяем сразу.
             partial_link_selector = "a:has-text('Оплатить частично'), button:has-text('Оплатить частично')"
-            partial_link_count = await page.locator(partial_link_selector).count()
-            logger.info("ФССП: ссылок 'Оплатить частично' найдено: %d", partial_link_count)
-            if partial_link_count == 0:
+            try:
+                await page.wait_for_selector(partial_link_selector, state="visible", timeout=10000)
+            except PlaywrightTimeoutError:
                 # Значит либо это уже не та страница (не перезагрузилась как ожидалось),
                 # либо ссылка после первого использования называется иначе.
                 await page.screenshot(path=os.path.join(BASE_DATA_DIR, "fssp_no_partial_link.png"))
