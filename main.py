@@ -7,7 +7,7 @@ import pyotp  # pip install pyotp — генерация TOTP-кодов из с
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(level=logging.INFO)
@@ -903,7 +903,7 @@ class GosuslugiBrowserClient:
 
         while True:
             if not card_pool:
-                await send_fn("🚫 карты закончились")
+                await send_fn("🚫 карты закончились (жмите «Добавить ещё карты» выше)")
                 return False
 
             card_num, expiry, cvv = card_pool.pop(0)
@@ -1000,18 +1000,19 @@ class StatusMessage:
     вместо отдельного сообщения на каждую попытку/карту (было слишком много
     спама: одно сообщение на старт карты, другое на результат)."""
 
-    def __init__(self, title):
+    def __init__(self, title, reply_markup=None):
         self._title = title
         self._lines = []
         self._message = None
+        self._reply_markup = reply_markup  # сохраняем, чтобы кнопка не пропадала при edit_text
 
     async def start(self, source_message):
-        self._message = await source_message.answer(self._title)
+        self._message = await source_message.answer(self._title, reply_markup=self._reply_markup)
 
     async def _render_and_edit(self):
         body = self._title + ("\n" + "\n".join(self._lines) if self._lines else "")
         try:
-            await self._message.edit_text(body)
+            await self._message.edit_text(body, reply_markup=self._reply_markup)
         except Exception:
             pass  # текст не изменился / временная ошибка редактирования — не критично
 
@@ -1025,6 +1026,53 @@ class StatusMessage:
     async def set_title(self, title):
         self._title = title
         await self._render_and_edit()
+
+
+ADD_CARDS_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="➕ Добавить ещё карты", callback_data="addcards")]
+])
+
+
+def parse_cards(text):
+    """Разбирает текст вида 'номер|дата|cvv' (можно несколько строк) в список
+    карт. Возвращает (cards, error) — при ошибке формата cards is None и в
+    error лежит готовое сообщение для пользователя."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    cards = []
+    for line in lines:
+        parts = line.split("|")
+        if len(parts) < 3:
+            return None, (
+                f"❌ Неверный формат в строке «{line}». Нужно: номер|дата|cvv "
+                "(можно несколько строк, по одной карте на строку)."
+            )
+        cards.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+    if not cards:
+        return None, "❌ Не нашёл ни одной карты. Введите: номер|дата|cvv"
+    return cards, None
+
+
+async def run_fine_payment(client, batch, fine):
+    """Прогоняет карты из общего пула batch['cards'] на одном конкретном
+    штрафе (fine) — вынесено из process_steps, чтобы им можно было запустить
+    как исходную проверку, так и повторный проход после кнопки "Добавить ещё
+    карты" уже после того, как первая партия карт закончилась."""
+    if fine["running"] or fine["resolved"]:
+        return
+    fine["running"] = True
+    try:
+        async def set_progress(current, total):
+            await fine["status_msg"].set_title(f"{fine['base_title']} {current}/{total}")
+
+        ok = await client.pay_with_cards(
+            batch["cards"], fine["status_msg"].push, fine["page"],
+            is_fssp=fine["is_fssp"], amount_str=fine["amount_str"],
+            total_cards=batch["total_cards"], set_progress_fn=set_progress,
+        )
+        if ok:
+            fine["resolved"] = True
+    finally:
+        fine["running"] = False
 
 
 @dp.message(CommandStart())
@@ -1121,6 +1169,7 @@ async def close_cmd(message: Message):
     for cid in list(user_data.keys()):
         user_data[cid].pop("pending_fines", None)
         user_data[cid].pop("fssp_queue", None)
+        user_data[cid].pop("card_batch", None)
     for cid in list(user_state.keys()):
         user_state[cid] = None
 
@@ -1148,6 +1197,20 @@ async def pay_cmd(message: Message):
         "Пожалуйста, введите УИН штрафа (20 или 25 цифр).\n"
         "Можно сразу два УИН, каждый с новой строки — бот проверит и оплатит "
         "их параллельно, в двух вкладках одного браузера."
+    )
+
+
+@dp.callback_query(F.data == "addcards")
+async def addcards_cb(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    batch = user_data.get(chat_id, {}).get("card_batch")
+    if not batch or all(f["resolved"] for f in batch["fines"]):
+        await callback.answer("Нечего продолжать — оплата уже завершена или ещё не запускалась.", show_alert=True)
+        return
+    user_state[chat_id] = "waiting_more_cards"
+    await callback.answer()
+    await callback.message.answer(
+        "Пришлите ещё карты (можно несколько строк, номер|дата|cvv) — добавлю их в очередь."
     )
 
 
@@ -1256,54 +1319,62 @@ async def process_steps(message: Message):
     elif state == "waiting_card_info":
         # Можно ввести несколько карт — каждую с новой строки в формате номер|дата|cvv.
         # Бот пробует их по очереди и останавливается на первой успешной оплате.
-        lines = [line.strip() for line in message.text.splitlines() if line.strip()]
-        cards = []
-        for line in lines:
-            parts = line.split("|")
-            if len(parts) < 3:
-                await message.answer(
-                    f"❌ Неверный формат в строке «{line}». Нужно: номер|дата|cvv "
-                    "(можно несколько строк, по одной карте на строку)."
-                )
-                return
-            cards.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
-
-        if not cards:
-            await message.answer("❌ Не нашёл ни одной карты. Введите: номер|дата|cvv")
+        cards, error = parse_cards(message.text)
+        if error:
+            await message.answer(error)
             return
 
         pending_fines = user_data[chat_id].get("pending_fines")
         if not pending_fines:
             pending_fines = [(await open_new_tab(client), None, False, None)]
         multi = len(pending_fines) > 1
-        total_cards_count = len(cards)  # фиксируем ДО того, как пул начнут разбирать
 
-        async def pay_one(index, page, uin, is_fssp, amount_str):
+        # "Общая очередь карт" — этот же список карт разбирают все штрафы
+        # партии, и кнопка "Добавить ещё карты" дозаписывает сюда же новые
+        # карты, даже если сама проверка к тому моменту уже закончилась.
+        batch = {"cards": cards, "fines": [], "total_cards": len(cards)}
+        for i, (page, uin, is_fssp, amount_str) in enumerate(pending_fines):
             base_title = (
-                f"💳 Штраф {index}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "")
+                f"💳 Штраф {i + 1}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "")
                 if multi else "💳 Оплата"
             )
-            status_msg = StatusMessage(base_title)
+            status_msg = StatusMessage(base_title, reply_markup=ADD_CARDS_KEYBOARD)
             await status_msg.start(message)
+            batch["fines"].append({
+                "page": page, "uin": uin, "is_fssp": is_fssp, "amount_str": amount_str,
+                "status_msg": status_msg, "base_title": base_title,
+                "running": False, "resolved": False,
+            })
+        user_data[chat_id]["card_batch"] = batch
 
-            async def send(text, replace_last=False):
-                await status_msg.push(text, replace_last)
-
-            async def set_progress(current, total):
-                await status_msg.set_title(f"{base_title} {current}/{total}")
-
-            await client.pay_with_cards(
-                cards, send, page, is_fssp=is_fssp, amount_str=amount_str,
-                total_cards=total_cards_count, set_progress_fn=set_progress,
-            )
-
-        await asyncio.gather(*[
-            pay_one(i + 1, page, uin, is_fssp, amount_str)
-            for i, (page, uin, is_fssp, amount_str) in enumerate(pending_fines)
-        ])
+        await asyncio.gather(*[run_fine_payment(client, batch, fine) for fine in batch["fines"]])
 
         user_data[chat_id].pop("pending_fines", None)
         user_state[chat_id] = "ready_for_pay"
+    elif state == "waiting_more_cards":
+        # Пользователь прислал карты в ответ на кнопку "Добавить ещё карты" —
+        # дописываем их в общий пул уже запущенной (или уже закончившейся)
+        # партии оплаты и, если есть неоплаченные штрафы, пробуем снова.
+        cards, error = parse_cards(message.text)
+        if error:
+            await message.answer(error)
+            return
+
+        batch = user_data.get(chat_id, {}).get("card_batch")
+        if not batch:
+            await message.answer("❌ Нет активной оплаты, к которой можно добавить карты.")
+            user_state[chat_id] = "ready_for_pay" if client.logged_in else None
+            return
+
+        batch["cards"].extend(cards)
+        batch["total_cards"] += len(cards)
+        await message.answer(f"➕ Добавил {len(cards)} карт(у/ы) в очередь.")
+
+        unresolved = [f for f in batch["fines"] if not f["resolved"] and not f["running"]]
+        if unresolved:
+            await asyncio.gather(*[run_fine_payment(client, batch, fine) for fine in unresolved])
+
+        user_state[chat_id] = "ready_for_pay" if client.logged_in else None
 
 
 async def main():
