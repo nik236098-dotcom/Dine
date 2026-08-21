@@ -863,7 +863,7 @@ class GosuslugiBrowserClient:
         return f"•••• {digits[-4:]}" if len(digits) >= 4 else "••••"
 
     async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None,
-                              total_cards=None, set_progress_fn=None):
+                              total_cards=None, set_progress_fn=None, payment_url=None, resume=False):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -882,7 +882,14 @@ class GosuslugiBrowserClient:
         total_cards — исходное количество карт в пуле (до всех .pop), нужно
         только для счётчика "N/M". set_progress_fn(current, total), если
         передан, вызывается перед каждой попыткой — им можно, например,
-        обновить заголовок статус-сообщения ("💳 Оплата 2/3")."""
+        обновить заголовок статус-сообщения ("💳 Оплата 2/3").
+        payment_url — адрес чистой формы оплаты (с уже введённой суммой для
+        ФССП), на которую нужно возвращаться перед каждой попыткой; если не
+        передан, берётся текущий page.url в момент вызова. resume=True — этот
+        вызов продолжает уже когда-то начатую оплату (после кнопки "Добавить
+        ещё карты"), поэтому страница почти наверняка осталась на экране
+        результата ПРЕДЫДУЩЕЙ попытки — значит, на payment_url нужно вернуться
+        даже перед самой первой картой этого вызова, а не только со второй."""
         SHORT_STATUS = {
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
@@ -896,7 +903,7 @@ class GosuslugiBrowserClient:
             await send_fn("⚠️ браузер не активен")
             return False
 
-        payment_url = page.url
+        payment_url = payment_url or page.url
         attempt = 0
         if total_cards is None:
             total_cards = len(card_pool)
@@ -919,10 +926,13 @@ class GosuslugiBrowserClient:
                 except Exception:
                     pass
 
-            if attempt > 1:
+            if attempt > 1 or resume:
                 # После неудачной попытки страница могла остаться в непонятном
                 # состоянии (экран отказа, отменённый 3DS и т.п.) — перед
                 # следующей картой возвращаемся на чистую страницу оплаты.
+                # resume=True — тот же случай и для самой первой карты этого
+                # вызова: значит, это продолжение после "карты закончились",
+                # а страница всё ещё показывает результат предыдущей попытки.
                 try:
                     await page.goto(payment_url, wait_until="load")
                     await asyncio.sleep(2)
@@ -1060,6 +1070,8 @@ async def run_fine_payment(client, batch, fine):
     if fine["running"] or fine["resolved"]:
         return
     fine["running"] = True
+    resume = fine["attempted"]  # это уже не первый заход на этот штраф —
+    fine["attempted"] = True    # страница осталась на экране предыдущего результата
     try:
         async def set_progress(current, total):
             await fine["status_msg"].set_title(f"{fine['base_title']} {current}/{total}")
@@ -1068,6 +1080,7 @@ async def run_fine_payment(client, batch, fine):
             batch["cards"], fine["status_msg"].push, fine["page"],
             is_fssp=fine["is_fssp"], amount_str=fine["amount_str"],
             total_cards=batch["total_cards"], set_progress_fn=set_progress,
+            payment_url=fine["payment_url"], resume=resume,
         )
         if ok:
             fine["resolved"] = True
@@ -1343,6 +1356,11 @@ async def process_steps(message: Message):
             batch["fines"].append({
                 "page": page, "uin": uin, "is_fssp": is_fssp, "amount_str": amount_str,
                 "status_msg": status_msg, "base_title": base_title,
+                # payment_url — чистая форма оплаты ПРЯМО СЕЙЧАС (сумма ФССП,
+                # если есть, уже выставлена) — на неё будем возвращаться перед
+                # каждой попыткой, включая самую первую при повторном заходе
+                # через "Добавить ещё карты" (см. resume в run_fine_payment).
+                "payment_url": page.url, "attempted": False,
                 "running": False, "resolved": False,
             })
         user_data[chat_id]["card_batch"] = batch
