@@ -70,6 +70,7 @@ class GosuslugiBrowserClient:
         self.page = None
         self.logged_in = False
         self.totp_secret = None  # если задан — код на шаге входа вводится автоматически
+        self.tab_pool = []  # свободные вкладки — переиспользуются вместо открытия новых
 
     async def _launch_browser(self):
         """Поднимает постоянный (persisted) браузерный профиль, если он ещё не запущен.
@@ -983,6 +984,7 @@ class GosuslugiBrowserClient:
         self.page = None
         self.context = None
         self.playwright = None
+        self.tab_pool = []  # старые вкладки закрылись вместе с context — пул больше не действителен
 
 
 # Один общий браузер/логин на всех, кто пишет боту — на Госуслугах всё равно
@@ -1003,6 +1005,25 @@ async def open_new_tab(client):
     await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     page.set_default_timeout(40000)
     return page
+
+
+async def acquire_tab(client):
+    """Берёт свободную вкладку из пула (оставшуюся от прошлого штрафа), а
+    новую открывает только если свободных нет — чтобы вкладки не копились
+    без переиспользования от /pay к /pay."""
+    while client.tab_pool:
+        page = client.tab_pool.pop()
+        if not page.is_closed():
+            return page
+    return await open_new_tab(client)
+
+
+def release_tab(client, page):
+    """Возвращает вкладку в пул, чтобы следующий штраф использовал её вместо
+    открытия новой. Вызывается, когда вкладка больше не нужна: штраф не
+    найден, оплата прошла, или партия оплаты брошена ради нового /pay."""
+    if page and not page.is_closed() and page not in client.tab_pool:
+        client.tab_pool.append(page)
 
 
 class StatusMessage:
@@ -1066,7 +1087,10 @@ async def run_fine_payment(client, batch, fine):
     """Прогоняет карты из общего пула batch['cards'] на одном конкретном
     штрафе (fine) — вынесено из process_steps, чтобы им можно было запустить
     как исходную проверку, так и повторный проход после кнопки "Добавить ещё
-    карты" уже после того, как первая партия карт закончилась."""
+    карты" уже после того, как первая партия карт закончилась.
+    У штрафа может быть НЕСКОЛЬКО вкладок (fine['pages']) — по одной карте на
+    вкладку одновременно, чтобы весь пул карт разбирался параллельно, а не по
+    очереди в одной вкладке."""
     if fine["running"] or fine["resolved"]:
         return
     fine["running"] = True
@@ -1076,14 +1100,23 @@ async def run_fine_payment(client, batch, fine):
         async def set_progress(current, total):
             await fine["status_msg"].set_title(f"{fine['base_title']} {current}/{total}")
 
-        ok = await client.pay_with_cards(
-            batch["cards"], fine["status_msg"].push, fine["page"],
-            is_fssp=fine["is_fssp"], amount_str=fine["amount_str"],
-            total_cards=batch["total_cards"], set_progress_fn=set_progress,
-            payment_url=fine["payment_url"], resume=resume,
+        async def run_on_page(page, payment_url):
+            return await client.pay_with_cards(
+                batch["cards"], fine["status_msg"].push, page,
+                is_fssp=fine["is_fssp"], amount_str=fine["amount_str"],
+                total_cards=batch["total_cards"], set_progress_fn=set_progress,
+                payment_url=payment_url, resume=resume,
+            )
+
+        results = await asyncio.gather(
+            *[run_on_page(p, u) for p, u in zip(fine["pages"], fine["payment_urls"])]
         )
-        if ok:
+        if any(results):
             fine["resolved"] = True
+            # Вкладки этого штрафа больше не нужны — возвращаем в общий пул,
+            # чтобы следующий штраф их переиспользовал вместо новых.
+            for p in fine["pages"]:
+                release_tab(client, p)
     finally:
         fine["running"] = False
 
@@ -1204,12 +1237,22 @@ async def pay_cmd(message: Message):
             await message.answer(res_msg + "\n\nИспользуйте команду /login")
             return
 
+    # Если от прошлого /pay остались недооплаченные штрафы (например, карты
+    # кончились и добавить больше не прислали) — их вкладки больше никому не
+    # принадлежат, возвращаем их в пул, а не бросаем висеть открытыми зря.
+    old_batch = user_data.get(chat_id, {}).get("card_batch")
+    if old_batch:
+        for fine in old_batch["fines"]:
+            if not fine["running"]:
+                for p in fine["pages"]:
+                    release_tab(client, p)
+
     user_data[chat_id] = {}
     user_state[chat_id] = "waiting_uin"
     await message.answer(
         "Пожалуйста, введите УИН штрафа (20 или 25 цифр).\n"
-        "Можно сразу два УИН, каждый с новой строки — бот проверит и оплатит "
-        "их параллельно, в двух вкладках одного браузера."
+        "Можно сразу несколько УИН, каждый с новой строки (до 5 штрафов) — "
+        "бот проверит и оплатит их параллельно, в отдельных вкладках одного браузера."
     )
 
 
@@ -1259,30 +1302,34 @@ async def process_steps(message: Message):
         else:
             user_state[chat_id] = None
     elif state == "waiting_uin":
-        # Можно ввести один или два УИН, каждый с новой строки — второй штраф
-        # обрабатывается на отдельной вкладке того же браузера (сессия входа
-        # общая на весь контекст), параллельно с первым.
+        # Можно ввести от одного до пяти УИН, каждый с новой строки — каждый
+        # штраф обрабатывается на отдельной вкладке того же браузера (сессия
+        # входа общая на весь контекст), параллельно с остальными.
         uins = [line.strip() for line in message.text.splitlines() if line.strip()]
         if not uins or any(not u.isdigit() or len(u) not in (20, 25) for u in uins):
             await message.answer(
-                "❌ Неверный формат. Каждый УИН — 20 или 25 цифр, можно одну или две строки:"
+                "❌ Неверный формат. Каждый УИН — 20 или 25 цифр, можно от одной до пяти строк:"
             )
             return
-        if len(uins) > 2:
-            await message.answer("❌ Пока можно проверить не больше 2 штрафов одновременно.")
+        if len(uins) > 5:
+            await message.answer("❌ Пока можно проверить не больше 5 штрафов одновременно.")
             return
 
         await message.answer(f"⏳ Проверяю {len(uins)} штраф(ов){' параллельно' if len(uins) > 1 else ''}...")
 
-        # Каждый УИН — на своей отдельной новой вкладке общего браузера (а не на
-        # client.page): так повторный/параллельный /pay из этого же или другого
-        # чата не пересекается с вкладками, уже занятыми другим вызовом.
-        pages = [await open_new_tab(client) for _ in uins]
+        # Каждый УИН — на своей вкладке общего браузера (а не на client.page):
+        # так повторный/параллельный /pay из этого же или другого чата не
+        # пересекается с вкладками, уже занятыми другим вызовом. Вкладки берём
+        # из общего пула (acquire_tab) — переиспользуем то, что осталось от
+        # прошлых штрафов, вместо того чтобы плодить новые.
+        pages = [await acquire_tab(client) for _ in uins]
 
         async def check_one(index, uin, page):
             success, res_msg, result_page, is_fssp = await client.check_penalty_by_uin(uin, page)
             prefix = f"Штраф {index}/{len(uins)} (УИН {uin}): " if len(uins) > 1 else ""
             await message.answer(f"{prefix}{res_msg}")
+            if not success:
+                release_tab(client, result_page or page)
             return success, result_page, uin, is_fssp
 
         results = await asyncio.gather(*[
@@ -1339,8 +1386,24 @@ async def process_steps(message: Message):
 
         pending_fines = user_data[chat_id].get("pending_fines")
         if not pending_fines:
-            pending_fines = [(await open_new_tab(client), None, False, None)]
+            pending_fines = [(await acquire_tab(client), None, False, None)]
         multi = len(pending_fines) > 1
+
+        async def prepare_replica_page(uin, is_fssp, amount_str):
+            """Открывает ЕЩЁ ОДНУ вкладку на тот же самый штраф (заново ищет
+            его по УИН) — используется, чтобы несколько карт одного штрафа
+            пробовались параллельно, а не по очереди в одной вкладке."""
+            tab = await acquire_tab(client)
+            success, _, result_page, _ = await client.check_penalty_by_uin(uin, tab)
+            if not success:
+                release_tab(client, result_page or tab)
+                return None
+            if is_fssp and amount_str:
+                ok_amt, _ = await client.set_partial_payment_amount(result_page, amount_str)
+                if not ok_amt:
+                    release_tab(client, result_page)
+                    return None
+            return result_page
 
         # "Общая очередь карт" — этот же список карт разбирают все штрафы
         # партии, и кнопка "Добавить ещё карты" дозаписывает сюда же новые
@@ -1351,16 +1414,31 @@ async def process_steps(message: Message):
                 f"💳 Штраф {i + 1}/{len(pending_fines)}" + (f" (УИН {uin})" if uin else "")
                 if multi else "💳 Оплата"
             )
+            pages = [page]
+            # Если штраф один и карт несколько — открываем этому же штрафу ещё
+            # вкладок (до 5 всего), по числу карт, чтобы они пробовались
+            # параллельно и оплата шла быстрее. При нескольких штрафах сразу
+            # это не делаем — иначе вкладок стало бы слишком много разом.
+            if not multi and uin and len(cards) > 1:
+                replicas = await asyncio.gather(*[
+                    prepare_replica_page(uin, is_fssp, amount_str)
+                    for _ in range(min(len(cards), 5) - 1)
+                ])
+                pages.extend(p for p in replicas if p)
+
             status_msg = StatusMessage(base_title, reply_markup=ADD_CARDS_KEYBOARD)
             await status_msg.start(message)
+            if len(pages) > 1:
+                await status_msg.push(f"⚡ {len(pages)} вкладки параллельно")
             batch["fines"].append({
-                "page": page, "uin": uin, "is_fssp": is_fssp, "amount_str": amount_str,
+                "pages": pages, "uin": uin, "is_fssp": is_fssp, "amount_str": amount_str,
                 "status_msg": status_msg, "base_title": base_title,
-                # payment_url — чистая форма оплаты ПРЯМО СЕЙЧАС (сумма ФССП,
-                # если есть, уже выставлена) — на неё будем возвращаться перед
-                # каждой попыткой, включая самую первую при повторном заходе
-                # через "Добавить ещё карты" (см. resume в run_fine_payment).
-                "payment_url": page.url, "attempted": False,
+                # payment_urls — чистая форма оплаты ПРЯМО СЕЙЧАС (сумма ФССП,
+                # если есть, уже выставлена), по одной на каждую вкладку — на
+                # неё будем возвращаться перед каждой попыткой, включая самую
+                # первую при повторном заходе через "Добавить ещё карты"
+                # (см. resume в run_fine_payment).
+                "payment_urls": [p.url for p in pages], "attempted": False,
                 "running": False, "resolved": False,
             })
         user_data[chat_id]["card_batch"] = batch
