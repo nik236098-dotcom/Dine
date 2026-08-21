@@ -167,8 +167,21 @@ class GosuslugiBrowserClient:
 
             return True, "Данные заполнены! Введите СМС-код из телефона в чат бота:"
         except Exception as e:
+            await self._dump_error_state("login")
             await self.close()
             return False, f"Ошибка при вводе данных: {str(e)}"
+
+    async def _dump_error_state(self, tag):
+        """Сохраняет скриншот и адрес страницы в момент ошибки в .bot_data —
+        чтобы разбирать сбои на сервере (без визуального доступа под рукой)
+        не вслепую, а по факту того, что реально показывал Госуслуги."""
+        try:
+            if self.page:
+                path = os.path.join(BASE_DATA_DIR, f"error_{tag}.png")
+                await self.page.screenshot(path=path)
+                logger.warning("Скриншот ошибки сохранён: %s (url=%s)", path, self.page.url)
+        except Exception as e:
+            logger.warning("Не удалось сохранить скриншот ошибки (%s): %s", tag, e)
 
     async def enter_sms_code(self, code):
         try:
