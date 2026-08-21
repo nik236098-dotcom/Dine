@@ -740,19 +740,25 @@ class GosuslugiBrowserClient:
             return False
 
         outcome = None
+        saw_processing = False  # "в обработке" мелькает и во время самой загрузки
+        # результата платежа, ещё до финального ответа — раньше это ошибочно
+        # сразу прерывало опрос, хотя чуть позже страница дорисовывала
+        # настоящий "Платёж успешно". Теперь "обработка" не завершает цикл
+        # сама по себе, а лишь запоминается как запасной вариант на случай,
+        # если ничего более окончательного так и не появится до конца опроса.
         for _ in range(8):  # опрашиваем ~40 секунд — банк может отвечать не сразу
             # СНАЧАЛА проверяем однозначные текстовые статусы на самой странице
-            # Госуслуг (обработка/отказ/успех) — они надёжнее эвристики "домен
+            # Госуслуг (отказ/успех/обработка) — они надёжнее эвристики "домен
             # похож на банк" ниже. Та эвристика однажды ложно сработала на уже
             # неактуальном/скрытом iframe от прошлого шага 3DS, из-за чего бот
             # пытался отменить платёж, который на самом деле просто "в обработке".
             try:
-                if await page.locator(processing_selector).count() > 0:
-                    outcome = "processing"
-                elif await page.locator(declined_selector).count() > 0:
+                if await page.locator(declined_selector).count() > 0:
                     outcome = "declined"
                 elif await page.locator(success_selector).count() > 0:
                     outcome = "success"
+                elif await page.locator(processing_selector).count() > 0:
+                    saw_processing = True
             except Exception:
                 pass
 
@@ -773,6 +779,9 @@ class GosuslugiBrowserClient:
             if outcome:
                 break
             await asyncio.sleep(5)
+
+        if not outcome and saw_processing:
+            outcome = "processing"
 
         if outcome == "processing":
             return "processing", "⏳ Платёж в обработке."
