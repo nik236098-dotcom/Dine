@@ -136,6 +136,17 @@ class GosuslugiBrowserClient:
                 self.logged_in = True
                 return "already_logged_in", "✨ Сессия активна! Можно сразу проверять штраф через /pay."
 
+            # Если в этом браузерном профиле уже кто-то входил раньше, esia
+            # сразу показывает запомненного пользователя (только поле пароля,
+            # без поля логина) — тогда сначала жмём "Другой пользователь",
+            # чтобы получить обычную форму с полем логина.
+            try:
+                await self.page.get_by_text("Другой пользователь").first.click(timeout=3000)
+                await asyncio.sleep(1)
+                logger.info("На странице входа был запомненный аккаунт — нажал 'Другой пользователь'")
+            except PlaywrightTimeoutError:
+                pass  # поле логина, видимо, и так на странице — идём дальше как обычно
+
             await self.page.wait_for_selector("input#login, input[type='text']", state="visible")
             login_field = self.page.locator("input#login, input[type='text']").first
             await login_field.click()
