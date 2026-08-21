@@ -587,7 +587,8 @@ class GosuslugiBrowserClient:
             # добавляем новую) — чтобы было видно, что бот жив, без спама.
             if send_fn and attempt % 10 == 0:
                 try:
-                    await send_fn(f"{self._mask_card(card_num)}: ⏳ банк {attempt}/{max_attempts}", True)
+                    masked = self._mask_card(card_num)
+                    await send_fn(f"{masked}: ⏳ банк {attempt}/{max_attempts}", masked)
                 except Exception:
                     pass
 
@@ -953,10 +954,14 @@ class GosuslugiBrowserClient:
                         )
                         await send_fn(f"⚠️ не удалось выставить сумму {amount_str} ₽ повторно ({fssp_msg})")
 
-            await send_fn(f"{masked}: ⏳")
+            # key=masked — чтобы при нескольких вкладках одного штрафа, пишущих
+            # в одно статус-сообщение параллельно, обновление статуса именно
+            # ЭТОЙ карты не попало по ошибке в чужую (последнюю на тот момент)
+            # строку другой карты, которую обрабатывает соседняя вкладка.
+            await send_fn(f"{masked}: ⏳", masked)
             status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
             logger.info("Карта %s — статус %s: %s", masked, status, message)
-            await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", True)
+            await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", masked)
 
             if status in ("success", "processing"):
                 # "В обработке" — банк уже принял платёж, следующую карту
@@ -1033,25 +1038,40 @@ class StatusMessage:
 
     def __init__(self, title, reply_markup=None):
         self._title = title
-        self._lines = []
+        self._lines = {}  # key -> текст строки; dict сохраняет порядок вставки
+        self._auto_key = 0
         self._message = None
         self._reply_markup = reply_markup  # сохраняем, чтобы кнопка не пропадала при edit_text
+        # Несколько вкладок ОДНОГО штрафа пишут в одно статус-сообщение
+        # параллельно — без лока конкурентные edit_text могли завершиться не
+        # в том порядке, в каком были вызваны, и на экране повисал устаревший
+        # текст. Лок гарантирует, что каждый edit_text читает self._lines
+        # заново, уже после всех более ранних вызовов.
+        self._render_lock = asyncio.Lock()
 
     async def start(self, source_message):
         self._message = await source_message.answer(self._title, reply_markup=self._reply_markup)
 
     async def _render_and_edit(self):
-        body = self._title + ("\n" + "\n".join(self._lines) if self._lines else "")
-        try:
-            await self._message.edit_text(body, reply_markup=self._reply_markup)
-        except Exception:
-            pass  # текст не изменился / временная ошибка редактирования — не критично
+        async with self._render_lock:
+            body = self._title + ("\n" + "\n".join(self._lines.values()) if self._lines else "")
+            try:
+                await self._message.edit_text(body, reply_markup=self._reply_markup)
+            except Exception:
+                pass  # текст не изменился / временная ошибка редактирования — не критично
 
-    async def push(self, text, replace_last=False):
-        if replace_last and self._lines:
-            self._lines[-1] = text
-        else:
-            self._lines.append(text)
+    async def push(self, text, key=None):
+        """Добавляет строку. Если передан key и такой ключ уже был — строка с
+        этим ключом обновляется НА МЕСТЕ (не в конце сообщения), иначе
+        добавляется новая. key обязателен для прогресса ПО КОНКРЕТНОЙ карте
+        (например, её маскированный номер) — иначе при нескольких вкладках
+        одного штрафа, пишущих в одно сообщение параллельно, "обновление
+        последней строки" могло попасть не в свою строку, а в чужую, которая
+        случайно оказалась последней в этот момент."""
+        if key is None:
+            key = f"_auto{self._auto_key}"
+            self._auto_key += 1
+        self._lines[key] = text
         await self._render_and_edit()
 
     async def set_title(self, title):
