@@ -982,7 +982,7 @@ class GosuslugiBrowserClient:
     async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None,
                               total_cards=None, set_progress_fn=None, payment_url=None, resume=False,
                               uin=None, chat_id=None, history_page=None, known_history_ts=None,
-                              history_lock=None):
+                              history_lock=None, ambiguous_attribution=False):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -1021,7 +1021,14 @@ class GosuslugiBrowserClient:
         вкладка по отдельности увидела бы один и тот же новый платёж (от той
         карты, что реально прошла) и обе засчитали бы его себе как успех,
         хотя платёж был один. Если не переданы — метод сам заводит вкладку и
-        снимок "до" (для одиночного вызова этого достаточно)."""
+        снимок "до" (для одиночного вызова этого достаточно).
+        ambiguous_attribution=True — этот вызов один из НЕСКОЛЬКИХ параллельных
+        для одного штрафа: 'История платежей' Госуслуг не показывает номер
+        карты, только УИН/сумму/статус, поэтому при подтверждении через
+        историю нельзя быть уверенным, что успех именно у ЭТОЙ карты, а не у
+        другой, которая пробовалась параллельно — короткий статус и итоговое
+        сообщение в этом случае формулируются с оговоркой, а не как точный
+        факт."""
         SHORT_STATUS = {
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
@@ -1118,6 +1125,7 @@ class GosuslugiBrowserClient:
                 # путался с отказом, то итог рисовался в iframe и вообще не
                 # находился) — если по нему выходит отказ/неясно, на всякий
                 # случай сверяемся с "Историей платежей" прежде чем сдаваться.
+                found_by_history = False
                 if history_page and status not in ("success", "processing"):
                     try:
                         # Лок — на случай нескольких вкладок ОДНОГО штрафа:
@@ -1139,17 +1147,30 @@ class GosuslugiBrowserClient:
                         found = False
                     if found:
                         status = "success"
+                        found_by_history = True
                         logger.info("Карта %s — отказ по форме, но найден новый платёж в истории (%s)", masked, found_ts)
                         if chat_id:
+                            # При параллельных картах одного штрафа история не
+                            # говорит, какая именно из них прошла — честно
+                            # предупреждаем об этом, а не приписываем успех
+                            # конкретной карте наугад.
+                            caveat = (
+                                " (пробовалось несколько карт одновременно — "
+                                "по истории не видно, какая именно; штраф в любом случае оплачен)"
+                                if ambiguous_attribution else ""
+                            )
                             try:
                                 await bot.send_message(
                                     chat_id,
-                                    f"🔎 Найден новый платёж в истории: УИН {uin}, сумма {amount_str} ₽ — оплата подтверждена.",
+                                    f"🔎 Найден новый платёж в истории: УИН {uin}, сумма {amount_str} ₽ — оплата подтверждена.{caveat}",
                                 )
                             except Exception as e:
                                 logger.warning("Не удалось отправить сообщение о находке в истории: %s", e)
 
-                await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", masked)
+                short_label = SHORT_STATUS.get(status, "❓")
+                if status == "success" and found_by_history and ambiguous_attribution:
+                    short_label = "✅?"  # успех штрафа подтверждён, но не факт, что именно эта карта
+                await send_fn(f"{masked}: {short_label}", masked)
 
                 if status in ("success", "processing"):
                     # "В обработке" — банк уже принял платёж, следующую карту
@@ -1334,6 +1355,13 @@ async def run_fine_payment(client, batch, fine, chat_id):
         async def set_progress(current, total):
             await fine["status_msg"].set_title(f"{fine['base_title']} {current}/{total}")
 
+        # Больше одной вкладки на штраф — это несколько карт, пробуемых
+        # параллельно ("турбо"-режим). История платежей не показывает номер
+        # карты, поэтому в этом случае успех через историю нельзя точно
+        # приписать конкретной карте — pay_with_cards формулирует это с
+        # оговоркой, а не как точный факт (см. ambiguous_attribution).
+        ambiguous_attribution = len(fine["pages"]) > 1
+
         async def run_on_page(page, payment_url):
             return await client.pay_with_cards(
                 batch["cards"], fine["status_msg"].push, page,
@@ -1342,6 +1370,7 @@ async def run_fine_payment(client, batch, fine, chat_id):
                 payment_url=payment_url, resume=resume, uin=fine["uin"],
                 chat_id=chat_id, history_page=history_page,
                 known_history_ts=known_history_ts, history_lock=history_lock,
+                ambiguous_attribution=ambiguous_attribution,
             )
 
         results = await asyncio.gather(
