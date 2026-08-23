@@ -401,10 +401,9 @@ class GosuslugiBrowserClient:
 
             if is_fssp:
                 amount_line = f" Сумма долга: {amount_str} ₽." if amount_str else ""
-                return True, (
-                    f"✅ ФССП найдено!{amount_line} Доступна частичная оплата.\n"
-                    "Введите сумму к оплате (числом, в рублях):"
-                ), page, True, amount_str
+                # Про ввод суммы — отдельным сообщением с кнопкой "Оставить
+                # текущую сумму" (см. prompt_fssp_amount), а не здесь.
+                return True, f"✅ ФССП найдено!{amount_line} Доступна частичная оплата.", page, True, amount_str
 
             amount_line = f" К оплате: {amount_str} ₽." if amount_str else ""
             return True, (
@@ -1317,6 +1316,55 @@ ADD_CARDS_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="➕ Добавить ещё карты", callback_data="addcards")]
 ])
 
+FSSP_AMOUNT_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="Оставить текущую сумму", callback_data="keepamount")]
+])
+
+
+async def prompt_fssp_amount(target_message, chat_id):
+    """Спрашивает сумму к оплате для ТЕКУЩЕГО (первого в очереди) ФССП —
+    с кнопкой 'Оставить текущую сумму', если сумма долга уже известна
+    (найдена при поиске штрафа): для многих ФССП сумма долга и так совпадает
+    с той, что нужно ввести (например, 750 ₽), и заново вручную вбивать её —
+    лишнее действие."""
+    fssp_queue = user_data.get(chat_id, {}).get("fssp_queue") or []
+    if not fssp_queue:
+        return
+    _, uin, amount = fssp_queue[0]
+    amount_line = f" (сумма долга: {amount} ₽)" if amount else ""
+    await target_message.answer(
+        f"Введите сумму к оплате для ФССП (УИН {uin}){amount_line}:",
+        reply_markup=FSSP_AMOUNT_KEYBOARD if amount else None,
+    )
+
+
+async def apply_fssp_amount(target_message, chat_id, client, cleaned):
+    """Общая логика после того, как сумма для текущего ФССП в очереди
+    определена — введена вручную или взята по кнопке 'Оставить текущую
+    сумму' — выставляет её на сайте и либо спрашивает сумму для следующего
+    ФССП в очереди, либо переходит к вводу карт."""
+    fssp_queue = user_data[chat_id].get("fssp_queue") or []
+    if not fssp_queue:
+        user_state[chat_id] = "waiting_card_info"
+        return
+
+    page, uin, _full_amount = fssp_queue.pop(0)
+    await target_message.answer(f"⏳ Задаю сумму {cleaned} ₽ для ФССП (УИН {uin})...")
+    ok, res_msg = await client.set_partial_payment_amount(page, cleaned)
+    await target_message.answer(res_msg if ok else f"❌ {res_msg}")
+
+    if ok:
+        user_data[chat_id].setdefault("pending_fines", []).append((page, uin, True, cleaned))
+
+    if fssp_queue:
+        await prompt_fssp_amount(target_message, chat_id)
+    else:
+        user_data[chat_id].pop("fssp_queue", None)
+        if user_data[chat_id].get("pending_fines"):
+            user_state[chat_id] = "waiting_card_info"
+        else:
+            user_state[chat_id] = "ready_for_pay" if client.logged_in else "waiting_username"
+
 
 def parse_cards(text):
     """Разбирает текст вида 'номер|дата|cvv' (можно несколько строк) в список
@@ -1560,6 +1608,26 @@ async def addcards_cb(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "keepamount")
+async def keepamount_cb(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    fssp_queue = user_data.get(chat_id, {}).get("fssp_queue") or []
+    if not fssp_queue:
+        await callback.answer("Нет активного запроса суммы ФССП.", show_alert=True)
+        return
+    _, uin, amount = fssp_queue[0]
+    if not amount:
+        await callback.answer("Сумма долга не определена — введите вручную.", show_alert=True)
+        return
+    await callback.answer()
+    # Как и в process_steps — регистрируем задачу для /stop, не перезаписывая
+    # уже отслеживаемую незавершённую (см. комментарий там же).
+    existing_task = active_tasks.get(chat_id)
+    if not existing_task or existing_task.done():
+        active_tasks[chat_id] = asyncio.current_task()
+    await apply_fssp_amount(callback.message, chat_id, shared_client, amount)
+
+
 @dp.message(lambda message: message.text and not message.text.startswith("/"))
 async def process_steps(message: Message):
     chat_id = message.chat.id
@@ -1640,7 +1708,10 @@ async def process_steps(message: Message):
             (page, uin, False, amount_str)
             for success, page, uin, is_fssp, amount_str in results if success and not is_fssp
         ]
-        fssp_queue = [(page, uin) for success, page, uin, is_fssp, amount_str in results if success and is_fssp]
+        fssp_queue = [
+            (page, uin, amount_str)
+            for success, page, uin, is_fssp, amount_str in results if success and is_fssp
+        ]
 
         if not ready_fines and not fssp_queue:
             user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
@@ -1649,34 +1720,14 @@ async def process_steps(message: Message):
         user_data[chat_id]["pending_fines"] = ready_fines
         user_data[chat_id]["fssp_queue"] = fssp_queue
         user_state[chat_id] = "waiting_fssp_amount" if fssp_queue else "waiting_card_info"
+        if fssp_queue:
+            await prompt_fssp_amount(message, chat_id)
     elif state == "waiting_fssp_amount":
         cleaned = re.sub(r"[^\d.]", "", message.text.strip().replace(",", "."))
         if not cleaned:
             await message.answer("❌ Введите сумму числом, например: 2250")
             return
-
-        fssp_queue = user_data[chat_id].get("fssp_queue") or []
-        if not fssp_queue:
-            user_state[chat_id] = "waiting_card_info"
-            return
-
-        page, uin = fssp_queue.pop(0)
-        await message.answer(f"⏳ Задаю сумму {cleaned} ₽ для ФССП (УИН {uin})...")
-        ok, res_msg = await client.set_partial_payment_amount(page, cleaned)
-        await message.answer(res_msg if ok else f"❌ {res_msg}")
-
-        if ok:
-            user_data[chat_id].setdefault("pending_fines", []).append((page, uin, True, cleaned))
-
-        if fssp_queue:
-            next_uin = fssp_queue[0][1]
-            await message.answer(f"Введите сумму к оплате для следующего ФССП (УИН {next_uin}):")
-        else:
-            user_data[chat_id].pop("fssp_queue", None)
-            if user_data[chat_id].get("pending_fines"):
-                user_state[chat_id] = "waiting_card_info"
-            else:
-                user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
+        await apply_fssp_amount(message, chat_id, client, cleaned)
     elif state == "waiting_card_info":
         # Можно ввести несколько карт — каждую с новой строки в формате номер|дата|cvv.
         # Бот пробует их по очереди и останавливается на первой успешной оплате.
