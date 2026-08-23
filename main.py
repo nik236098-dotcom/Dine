@@ -38,6 +38,13 @@ USER_PROFILE_DIR = os.path.join(BASE_DATA_DIR, "gosuslugi_profile")
 # Страница прямого поиска и оплаты штрафа/квитанции по УИН.
 QUITTANCE_URL = "https://www.gosuslugi.ru/pay/quittance"
 
+# "История платежей" — надёжный источник правды об итоге оплаты: текст на
+# самой форме оплаты угадывался и то и дело подводил (дисклеймеры путались
+# с отказом, результат рисовался в iframe и вообще не находился). Здесь же
+# у Госуслуг каждый платёж — отдельная карточка с УИН, суммой и статусом
+# ("Принят" и т.п.), который можно свериться с тем, что было задано.
+PAYMENT_HISTORY_URL = "https://www.gosuslugi.ru/pay/paymentHistory"
+
 # Секретные ключи TOTP хранятся отдельным локальным файлом (папка .bot_data
 # в .gitignore, наружу не уходит) — чтобы не спрашивать /totp заново после
 # каждого перезапуска бота.
@@ -256,7 +263,7 @@ class GosuslugiBrowserClient:
         таких проверок параллельно на разных вкладках одного браузера."""
         try:
             if not page or not self.logged_in:
-                return False, "Вы не авторизованы. Введите /login.", page, False
+                return False, "Вы не авторизованы. Введите /login.", page, False, None
 
             # БАГ БЫЛ ЗДЕСЬ: раньше переход выполнялся на "https://gosuslugi.ru" (главная),
             # а не на страницу поиска квитанций — на главной нет поля ввода УИН,
@@ -270,7 +277,7 @@ class GosuslugiBrowserClient:
             await asyncio.sleep(2)
             if "login" in page.url or "esia" in page.url:
                 self.logged_in = False
-                return False, "⚠️ Сессия слетела — сайт вернул вас на страницу входа. Авторизуйтесь заново через /login.", page, False
+                return False, "⚠️ Сессия слетела — сайт вернул вас на страницу входа. Авторизуйтесь заново через /login.", page, False, None
 
             uin_selector = (
                 "input[name*='uin' i], input[id*='uin' i], "
@@ -340,7 +347,7 @@ class GosuslugiBrowserClient:
                     logger.warning("Не удалось прочитать текст страницы для диагностики: %s", diag_err)
 
                 if await page.locator(not_found_selector).count() > 0:
-                    return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно.", page, False
+                    return False, "ℹ️ По этому УИН ничего не найдено — возможно, штраф уже оплачен или УИН введён неверно.", page, False, None
                 raise PlaywrightTimeoutError("сумма штрафа не появилась ни на странице, ни во фреймах")
 
             # Достаём сумму штрафа для вывода в сообщении пользователю.
@@ -397,14 +404,14 @@ class GosuslugiBrowserClient:
                 return True, (
                     f"✅ ФССП найдено!{amount_line} Доступна частичная оплата.\n"
                     "Введите сумму к оплате (числом, в рублях):"
-                ), page, True
+                ), page, True, amount_str
 
             amount_line = f" К оплате: {amount_str} ₽." if amount_str else ""
             return True, (
                 f"✅ Штраф найден!{amount_line} Введите данные карты в формате: номер|дата|cvv\n"
                 "Можно несколько карт — каждую с новой строки, бот будет пробовать их по очереди, "
                 "пока платёж не пройдёт."
-            ), page, False
+            ), page, False, amount_str
         except Exception as e:
             try:
                 if page:
@@ -417,8 +424,8 @@ class GosuslugiBrowserClient:
             # ошибка выглядит как обычный Timeout, хотя причина понятна по URL.
             if "login" in current_url or "esia" in current_url:
                 self.logged_in = False
-                return False, "⚠️ Сессия слетела прямо во время поиска. Авторизуйтесь заново через /login.", page, False
-            return False, f"Ошибка поиска: {str(e)} (страница: {current_url})", page, False
+                return False, "⚠️ Сессия слетела прямо во время поиска. Авторизуйтесь заново через /login.", page, False, None
+            return False, f"Ошибка поиска: {str(e)} (страница: {current_url})", page, False, None
 
     async def _wait_for_page_content(self, page, min_length=50, max_wait=60):
         """Ждёт, пока на странице появится хоть какой-то текст, вместо того
@@ -681,6 +688,99 @@ class GosuslugiBrowserClient:
             current_url = page.url if page else "?"
             return "error", f"Не удалось автоматически заполнить карту: {str(e)} (страница: {current_url})"
 
+    async def _find_history_blocks(self, history_page, uin):
+        """Открывает 'Историю платежей' и возвращает список текстов карточек,
+        относящихся к этому УИН (обычно одна, но их может быть несколько,
+        если штраф уже оплачивался раньше). Ищем по видимому тексту, а не по
+        угаданным CSS-классам — карточку определяем как самого верхнего
+        предка, который ещё содержит "УИН: <uin>" ровно один раз (выше —
+        уже соседняя карточка/список)."""
+        try:
+            await history_page.goto(PAYMENT_HISTORY_URL, wait_until="load")
+        except Exception as e:
+            logger.warning("Не удалось открыть историю платежей: %s", e)
+            return []
+        await self._wait_for_page_content(history_page)
+        try:
+            return await history_page.evaluate(
+                """(uin) => {
+                    const marker = 'УИН: ' + uin;
+                    const escaped = marker.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+                    const re = new RegExp(escaped, 'g');
+                    const results = [];
+                    const all = document.querySelectorAll('body *');
+                    for (const el of all) {
+                        if (el.children.length > 0) continue;
+                        const text = el.textContent || '';
+                        if (!text.includes(marker)) continue;
+                        let card = el;
+                        let node = el;
+                        for (let i = 0; i < 10 && node.parentElement; i++) {
+                            const parent = node.parentElement;
+                            const count = (parent.textContent.match(re) || []).length;
+                            if (count > 1) break;
+                            card = parent;
+                            node = parent;
+                        }
+                        results.push(card.textContent.trim());
+                    }
+                    return results;
+                }""",
+                uin,
+            )
+        except Exception as e:
+            logger.warning("Не удалось прочитать историю платежей: %s", e)
+            return []
+
+    async def check_payment_in_history(self, history_page, uin, amount_str, exclude_timestamps=None):
+        """Ищет в 'Истории платежей' карточку с этим УИН и суммой (сравнение —
+        по цифрам, без учёта пробелов и валютного знака). exclude_timestamps —
+        метки времени, уже виденные ДО текущей попытки оплаты (см. вызов в
+        pay_with_cards), чтобы не спутать старый (прошлый) платёж с только
+        что прошедшим новым. Возвращает (найдено, метка_времени, текст_карточки)."""
+        if not uin or not amount_str:
+            return False, None, None
+        target_digits = re.sub(r"\D", "", amount_str)
+        if not target_digits:
+            return False, None, None
+        exclude_timestamps = exclude_timestamps or set()
+
+        blocks = await self._find_history_blocks(history_page, uin)
+        for block in blocks:
+            amount_match = re.search(r"(\d[\d \s]*\d)\s*[Р₽](?![а-яёА-ЯЁ])", block)
+            if not amount_match or re.sub(r"\D", "", amount_match.group(1)) != target_digits:
+                continue
+            ts_match = re.search(r"\d{2}\.\d{2}\.\d{4}\s*в\s*\d{2}:\d{2}", block)
+            # Если формат времени вдруг окажется другим и регэксп не совпадёт —
+            # используем кусок текста самой карточки как запасной ключ, чтобы
+            # такую запись всё равно можно было отличить/исключить как уже
+            # виденную (иначе она бы всегда казалась "новой").
+            timestamp = ts_match.group(0) if ts_match else block.strip()[:80]
+            if timestamp in exclude_timestamps:
+                continue
+            return True, timestamp, block
+        return False, None, None
+
+    async def known_history_timestamps(self, history_page, uin, amount_str):
+        """Снимок 'ДО' — метки времени уже существующих в истории карточек с
+        этим УИН и суммой, снятый ПЕРЕД первой попыткой ввода карты. Дальше
+        check_payment_in_history(..., exclude_timestamps=этот_снимок)
+        распознаёт только НОВУЮ карточку, а не штраф, оплаченный раньше."""
+        found, timestamp, _ = await self.check_payment_in_history(history_page, uin, amount_str)
+        timestamps = set()
+        if found and timestamp:
+            timestamps.add(timestamp)
+        # check_payment_in_history возвращает только первое совпадение — если
+        # таких платежей в истории уже несколько, находим и остальные, гоняя
+        # его же с растущим списком исключений (карточек обычно единицы).
+        while found and timestamp:
+            found, timestamp, _ = await self.check_payment_in_history(
+                history_page, uin, amount_str, exclude_timestamps=timestamps
+            )
+            if found and timestamp:
+                timestamps.add(timestamp)
+        return timestamps
+
     async def _await_payment_outcome(self, page):
         """После клика 'Оплатить' смотрим, что реально ответил сайт: успех,
         отказ или запрос 3DS-подтверждения. Точные тексты угаданы (реального
@@ -880,7 +980,8 @@ class GosuslugiBrowserClient:
         return f"•••• {digits[-4:]}" if len(digits) >= 4 else "••••"
 
     async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None,
-                              total_cards=None, set_progress_fn=None, payment_url=None, resume=False):
+                              total_cards=None, set_progress_fn=None, payment_url=None, resume=False,
+                              uin=None):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -906,7 +1007,11 @@ class GosuslugiBrowserClient:
         вызов продолжает уже когда-то начатую оплату (после кнопки "Добавить
         ещё карты"), поэтому страница почти наверняка осталась на экране
         результата ПРЕДЫДУЩЕЙ попытки — значит, на payment_url нужно вернуться
-        даже перед самой первой картой этого вызова, а не только со второй."""
+        даже перед самой первой картой этого вызова, а не только со второй.
+        uin — если передан (вместе с amount_str), при отказе/неясном статусе
+        по тексту на форме оплаты бот дополнительно сверяется с 'Историей
+        платежей' Госуслуг — она надёжнее угадывания текста на самой форме
+        (см. check_payment_in_history)."""
         SHORT_STATUS = {
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
@@ -925,63 +1030,100 @@ class GosuslugiBrowserClient:
         if total_cards is None:
             total_cards = len(card_pool)
 
-        while True:
-            if not card_pool:
-                await send_fn("🚫 карты закончились (жмите «Добавить ещё карты» выше)")
-                return False
+        # "История платежей" — независимая от формы оплаты проверка (см.
+        # докстринг). Открываем отдельную вкладку один раз на весь штраф и
+        # запоминаем, что там уже было ДО первой попытки — иначе штраф,
+        # оплаченный когда-то раньше с той же суммой, спутался бы с только
+        # что прошедшим платежом.
+        history_page = None
+        known_history_ts = set()
+        if uin and amount_str:
+            try:
+                history_page = await acquire_tab(self)
+                known_history_ts = await self.known_history_timestamps(history_page, uin, amount_str)
+            except Exception as e:
+                logger.warning("Не удалось подготовить проверку истории платежей: %s", e)
+                history_page = None
 
-            card_num, expiry, cvv = card_pool.pop(0)
-            attempt += 1
-            masked = self._mask_card(card_num)
+        try:
+            while True:
+                if not card_pool:
+                    await send_fn("🚫 карты закончились (жмите «Добавить ещё карты» выше)")
+                    return False
 
-            # card_pool общий на несколько параллельных оплат, поэтому текущий
-            # номер попытки — это сколько карт всего уже разобрано из пула
-            # (кем угодно), а не локальный счётчик именно этого вызова.
-            if set_progress_fn:
-                try:
-                    await set_progress_fn(total_cards - len(card_pool), total_cards)
-                except Exception:
-                    pass
+                card_num, expiry, cvv = card_pool.pop(0)
+                attempt += 1
+                masked = self._mask_card(card_num)
 
-            if attempt > 1 or resume:
-                # После неудачной попытки страница могла остаться в непонятном
-                # состоянии (экран отказа, отменённый 3DS и т.п.) — перед
-                # следующей картой возвращаемся на чистую страницу оплаты.
-                # resume=True — тот же случай и для самой первой карты этого
-                # вызова: значит, это продолжение после "карты закончились",
-                # а страница всё ещё показывает результат предыдущей попытки.
-                try:
-                    await page.goto(payment_url, wait_until="load")
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    logger.warning("Не удалось перезагрузить страницу оплаты перед картой %s: %s", masked, e)
+                # card_pool общий на несколько параллельных оплат, поэтому текущий
+                # номер попытки — это сколько карт всего уже разобрано из пула
+                # (кем угодно), а не локальный счётчик именно этого вызова.
+                if set_progress_fn:
+                    try:
+                        await set_progress_fn(total_cards - len(card_pool), total_cards)
+                    except Exception:
+                        pass
 
-                # У ФССП перезагрузка страницы сбрасывает частичную сумму обратно
-                # на полную — задаём её заново перед каждой новой картой, а не
-                # только один раз в самом начале.
-                if is_fssp and amount_str:
-                    ok, fssp_msg = await self.set_partial_payment_amount(page, amount_str)
-                    if ok:
-                        logger.info("ФССП: сумма переустановлена перед картой %s: %s", masked, fssp_msg)
-                    else:
-                        logger.warning(
-                            "Не удалось повторно задать сумму ФССП перед картой %s: %s", masked, fssp_msg
+                if attempt > 1 or resume:
+                    # После неудачной попытки страница могла остаться в непонятном
+                    # состоянии (экран отказа, отменённый 3DS и т.п.) — перед
+                    # следующей картой возвращаемся на чистую страницу оплаты.
+                    # resume=True — тот же случай и для самой первой карты этого
+                    # вызова: значит, это продолжение после "карты закончились",
+                    # а страница всё ещё показывает результат предыдущей попытки.
+                    try:
+                        await page.goto(payment_url, wait_until="load")
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        logger.warning("Не удалось перезагрузить страницу оплаты перед картой %s: %s", masked, e)
+
+                    # У ФССП перезагрузка страницы сбрасывает частичную сумму обратно
+                    # на полную — задаём её заново перед каждой новой картой, а не
+                    # только один раз в самом начале.
+                    if is_fssp and amount_str:
+                        ok, fssp_msg = await self.set_partial_payment_amount(page, amount_str)
+                        if ok:
+                            logger.info("ФССП: сумма переустановлена перед картой %s: %s", masked, fssp_msg)
+                        else:
+                            logger.warning(
+                                "Не удалось повторно задать сумму ФССП перед картой %s: %s", masked, fssp_msg
+                            )
+                            await send_fn(f"⚠️ не удалось выставить сумму {amount_str} ₽ повторно ({fssp_msg})")
+
+                # key=masked — чтобы при нескольких вкладках одного штрафа, пишущих
+                # в одно статус-сообщение параллельно, обновление статуса именно
+                # ЭТОЙ карты не попало по ошибке в чужую (последнюю на тот момент)
+                # строку другой карты, которую обрабатывает соседняя вкладка.
+                await send_fn(f"{masked}: ⏳", masked)
+                status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
+                logger.info("Карта %s — статус %s: %s", masked, status, message)
+
+                # Текст на самой форме оплаты не раз подводил (то дисклеймер
+                # путался с отказом, то итог рисовался в iframe и вообще не
+                # находился) — если по нему выходит отказ/неясно, на всякий
+                # случай сверяемся с "Историей платежей" прежде чем сдаваться.
+                if history_page and status not in ("success", "processing"):
+                    try:
+                        found, found_ts, _ = await self.check_payment_in_history(
+                            history_page, uin, amount_str, exclude_timestamps=known_history_ts
                         )
-                        await send_fn(f"⚠️ не удалось выставить сумму {amount_str} ₽ повторно ({fssp_msg})")
+                    except Exception as e:
+                        logger.warning("Ошибка проверки истории платежей: %s", e)
+                        found = False
+                    if found:
+                        status = "success"
+                        logger.info("Карта %s — отказ по форме, но найден новый платёж в истории (%s)", masked, found_ts)
+                        await send_fn(f"🔎 Найден в истории платежей: УИН {uin}, сумма {amount_str} ₽ — оплата подтверждена.")
 
-            # key=masked — чтобы при нескольких вкладках одного штрафа, пишущих
-            # в одно статус-сообщение параллельно, обновление статуса именно
-            # ЭТОЙ карты не попало по ошибке в чужую (последнюю на тот момент)
-            # строку другой карты, которую обрабатывает соседняя вкладка.
-            await send_fn(f"{masked}: ⏳", masked)
-            status, message = await self._submit_single_card(card_num, expiry, cvv, page, send_fn=send_fn)
-            logger.info("Карта %s — статус %s: %s", masked, status, message)
-            await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", masked)
+                await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", masked)
 
-            if status in ("success", "processing"):
-                # "В обработке" — банк уже принял платёж, следующую карту
-                # пробовать не нужно (это не отказ).
-                return True
+                if status in ("success", "processing"):
+                    # "В обработке" — банк уже принял платёж, следующую карту
+                    # пробовать не нужно (это не отказ).
+                    return True
+        finally:
+            if history_page:
+                release_tab(self, history_page)
 
     async def close(self):
         self.logged_in = False
@@ -1140,7 +1282,7 @@ async def run_fine_payment(client, batch, fine):
                 batch["cards"], fine["status_msg"].push, page,
                 is_fssp=fine["is_fssp"], amount_str=fine["amount_str"],
                 total_cards=batch["total_cards"], set_progress_fn=set_progress,
-                payment_url=payment_url, resume=resume,
+                payment_url=payment_url, resume=resume, uin=fine["uin"],
             )
 
         results = await asyncio.gather(
@@ -1367,21 +1509,25 @@ async def process_steps(message: Message):
         pages = [await acquire_tab(client) for _ in uins]
 
         async def check_one(index, uin, page):
-            success, res_msg, result_page, is_fssp = await client.check_penalty_by_uin(uin, page)
+            success, res_msg, result_page, is_fssp, amount_str = await client.check_penalty_by_uin(uin, page)
             prefix = f"Штраф {index}/{len(uins)} (УИН {uin}): " if len(uins) > 1 else ""
             await message.answer(f"{prefix}{res_msg}")
             if not success:
                 release_tab(client, result_page or page)
-            return success, result_page, uin, is_fssp
+            return success, result_page, uin, is_fssp, amount_str
 
         results = await asyncio.gather(*[
             check_one(i + 1, uin, pages[i]) for i, uin in enumerate(uins)
         ])
 
-        # Обычные штрафы идут сразу к вводу карты, а ФССП — сначала нужно
+        # Обычные штрафы идут сразу к вводу карты (сумма уже известна — нужна
+        # позже для сверки с "Историей платежей"), а ФССП — сначала нужно
         # спросить сумму частичной оплаты и задать её на сайте.
-        ready_fines = [(page, uin, False, None) for success, page, uin, is_fssp in results if success and not is_fssp]
-        fssp_queue = [(page, uin) for success, page, uin, is_fssp in results if success and is_fssp]
+        ready_fines = [
+            (page, uin, False, amount_str)
+            for success, page, uin, is_fssp, amount_str in results if success and not is_fssp
+        ]
+        fssp_queue = [(page, uin) for success, page, uin, is_fssp, amount_str in results if success and is_fssp]
 
         if not ready_fines and not fssp_queue:
             user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
@@ -1436,7 +1582,7 @@ async def process_steps(message: Message):
             его по УИН) — используется, чтобы несколько карт одного штрафа
             пробовались параллельно, а не по очереди в одной вкладке."""
             tab = await acquire_tab(client)
-            success, _, result_page, _ = await client.check_penalty_by_uin(uin, tab)
+            success, _, result_page, _, _ = await client.check_penalty_by_uin(uin, tab)
             if not success:
                 release_tab(client, result_page or tab)
                 return None
