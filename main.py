@@ -787,6 +787,14 @@ class GosuslugiBrowserClient:
                 break
             await asyncio.sleep(5)
 
+        # Диагностика: скриншот того, что реально видел бот в момент решения
+        # (или после 40с, если так и не понял) — чтобы не гадать вслепую,
+        # если статус снова определится неверно.
+        try:
+            await page.screenshot(path=os.path.join(BASE_DATA_DIR, f"last_outcome_{outcome or 'unknown'}.png"))
+        except Exception:
+            pass
+
         if outcome == "processing":
             return "processing", "⏳ Платёж в обработке."
 
