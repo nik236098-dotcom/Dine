@@ -981,7 +981,7 @@ class GosuslugiBrowserClient:
 
     async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None,
                               total_cards=None, set_progress_fn=None, payment_url=None, resume=False,
-                              uin=None):
+                              uin=None, chat_id=None):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -1011,7 +1011,9 @@ class GosuslugiBrowserClient:
         uin — если передан (вместе с amount_str), при отказе/неясном статусе
         по тексту на форме оплаты бот дополнительно сверяется с 'Историей
         платежей' Госуслуг — она надёжнее угадывания текста на самой форме
-        (см. check_payment_in_history)."""
+        (см. check_payment_in_history). chat_id — если передан вместе с uin,
+        при таком обнаружении бот шлёт отдельным НОВЫМ сообщением в чат (не
+        строкой в статус-сообщение), что платёж найден в истории."""
         SHORT_STATUS = {
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
@@ -1113,7 +1115,14 @@ class GosuslugiBrowserClient:
                     if found:
                         status = "success"
                         logger.info("Карта %s — отказ по форме, но найден новый платёж в истории (%s)", masked, found_ts)
-                        await send_fn(f"🔎 Найден в истории платежей: УИН {uin}, сумма {amount_str} ₽ — оплата подтверждена.")
+                        if chat_id:
+                            try:
+                                await bot.send_message(
+                                    chat_id,
+                                    f"🔎 Найден новый платёж в истории: УИН {uin}, сумма {amount_str} ₽ — оплата подтверждена.",
+                                )
+                            except Exception as e:
+                                logger.warning("Не удалось отправить сообщение о находке в истории: %s", e)
 
                 await send_fn(f"{masked}: {SHORT_STATUS.get(status, '❓')}", masked)
 
@@ -1260,7 +1269,7 @@ def parse_cards(text):
     return cards, None
 
 
-async def run_fine_payment(client, batch, fine):
+async def run_fine_payment(client, batch, fine, chat_id):
     """Прогоняет карты из общего пула batch['cards'] на одном конкретном
     штрафе (fine) — вынесено из process_steps, чтобы им можно было запустить
     как исходную проверку, так и повторный проход после кнопки "Добавить ещё
@@ -1283,6 +1292,7 @@ async def run_fine_payment(client, batch, fine):
                 is_fssp=fine["is_fssp"], amount_str=fine["amount_str"],
                 total_cards=batch["total_cards"], set_progress_fn=set_progress,
                 payment_url=payment_url, resume=resume, uin=fine["uin"],
+                chat_id=chat_id,
             )
 
         results = await asyncio.gather(
@@ -1631,7 +1641,7 @@ async def process_steps(message: Message):
             })
         user_data[chat_id]["card_batch"] = batch
 
-        await asyncio.gather(*[run_fine_payment(client, batch, fine) for fine in batch["fines"]])
+        await asyncio.gather(*[run_fine_payment(client, batch, fine, chat_id) for fine in batch["fines"]])
 
         user_data[chat_id].pop("pending_fines", None)
         user_state[chat_id] = "ready_for_pay"
@@ -1656,7 +1666,7 @@ async def process_steps(message: Message):
 
         unresolved = [f for f in batch["fines"] if not f["resolved"] and not f["running"]]
         if unresolved:
-            await asyncio.gather(*[run_fine_payment(client, batch, fine) for fine in unresolved])
+            await asyncio.gather(*[run_fine_payment(client, batch, fine, chat_id) for fine in unresolved])
 
         user_state[chat_id] = "ready_for_pay" if client.logged_in else None
 
