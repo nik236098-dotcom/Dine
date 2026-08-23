@@ -982,7 +982,7 @@ class GosuslugiBrowserClient:
     async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None,
                               total_cards=None, set_progress_fn=None, payment_url=None, resume=False,
                               uin=None, chat_id=None, history_page=None, known_history_ts=None,
-                              history_lock=None, ambiguous_attribution=False):
+                              history_lock=None, ambiguous_attribution=False, stop_event=None):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -1028,7 +1028,12 @@ class GosuslugiBrowserClient:
         историю нельзя быть уверенным, что успех именно у ЭТОЙ карты, а не у
         другой, которая пробовалась параллельно — короткий статус и итоговое
         сообщение в этом случае формулируются с оговоркой, а не как точный
-        факт."""
+        факт.
+        stop_event — общий на все параллельные вкладки одного штрафа
+        asyncio.Event: как только ЛЮБАЯ из них подтверждает успех (по тексту
+        формы или по истории), событие взводится, и остальные вкладки — как
+        только освободятся между попытками — сразу останавливаются, не тратя
+        оставшиеся карты на уже оплаченный штраф."""
         SHORT_STATUS = {
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
@@ -1070,6 +1075,12 @@ class GosuslugiBrowserClient:
 
         try:
             while True:
+                # Соседняя вкладка этого же штрафа уже подтвердила успех, пока
+                # эта вкладка обрабатывала свою предыдущую карту — штраф уже
+                # оплачен, дальше пробовать нечего.
+                if stop_event and stop_event.is_set():
+                    return True
+
                 if not card_pool:
                     await send_fn("🚫 карты закончились (жмите «Добавить ещё карты» выше)")
                     return False
@@ -1155,14 +1166,17 @@ class GosuslugiBrowserClient:
                             # предупреждаем об этом, а не приписываем успех
                             # конкретной карте наугад.
                             caveat = (
-                                " (пробовалось несколько карт одновременно — "
-                                "по истории не видно, какая именно; штраф в любом случае оплачен)"
+                                "\n\n⚠️ Пробовалось несколько карт одновременно — по истории не видно, "
+                                "какая именно, но штраф в любом случае оплачен."
                                 if ambiguous_attribution else ""
                             )
                             try:
                                 await bot.send_message(
                                     chat_id,
-                                    f"🔎 Найден новый платёж в истории: УИН {uin}, сумма {amount_str} ₽ — оплата подтверждена.{caveat}",
+                                    "✅ Платёж найден!\n\n"
+                                    f"УИН: {uin}\n"
+                                    f"Сумма: {amount_str} ₽\n\n"
+                                    f"Подтверждено по истории платежей Госуслуг.{caveat}",
                                 )
                             except Exception as e:
                                 logger.warning("Не удалось отправить сообщение о находке в истории: %s", e)
@@ -1174,7 +1188,12 @@ class GosuslugiBrowserClient:
 
                 if status in ("success", "processing"):
                     # "В обработке" — банк уже принял платёж, следующую карту
-                    # пробовать не нужно (это не отказ).
+                    # пробовать не нужно (это не отказ). Взводим общий
+                    # stop_event — остальные параллельные вкладки этого же
+                    # штрафа увидят его на следующей проверке в начале цикла
+                    # и тоже остановятся, не тратя оставшиеся карты впустую.
+                    if stop_event:
+                        stop_event.set()
                     return True
         finally:
             # Общую (переданную извне) вкладку истории не закрываем сами —
@@ -1361,6 +1380,10 @@ async def run_fine_payment(client, batch, fine, chat_id):
         # приписать конкретной карте — pay_with_cards формулирует это с
         # оговоркой, а не как точный факт (см. ambiguous_attribution).
         ambiguous_attribution = len(fine["pages"]) > 1
+        # Общий на все вкладки этого штрафа — как только ОДНА из них
+        # подтвердит успех, остальные увидят взведённый флаг и перестанут
+        # пробовать оставшиеся карты из очереди (штраф уже оплачен).
+        stop_event = asyncio.Event()
 
         async def run_on_page(page, payment_url):
             return await client.pay_with_cards(
@@ -1370,7 +1393,7 @@ async def run_fine_payment(client, batch, fine, chat_id):
                 payment_url=payment_url, resume=resume, uin=fine["uin"],
                 chat_id=chat_id, history_page=history_page,
                 known_history_ts=known_history_ts, history_lock=history_lock,
-                ambiguous_attribution=ambiguous_attribution,
+                ambiguous_attribution=ambiguous_attribution, stop_event=stop_event,
             )
 
         results = await asyncio.gather(
