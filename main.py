@@ -981,7 +981,8 @@ class GosuslugiBrowserClient:
 
     async def pay_with_cards(self, card_pool, send_fn, page, is_fssp=False, amount_str=None,
                               total_cards=None, set_progress_fn=None, payment_url=None, resume=False,
-                              uin=None, chat_id=None):
+                              uin=None, chat_id=None, history_page=None, known_history_ts=None,
+                              history_lock=None):
         """Тянет карты из ОБЩЕГО пула card_pool (список [(номер, срок, cvv), ...]),
         пока платёж не пройдёт успешно, или пул не опустеет. card_pool может быть
         одним и тем же списком, переданным нескольким параллельным вызовам этого
@@ -1013,7 +1014,14 @@ class GosuslugiBrowserClient:
         платежей' Госуслуг — она надёжнее угадывания текста на самой форме
         (см. check_payment_in_history). chat_id — если передан вместе с uin,
         при таком обнаружении бот шлёт отдельным НОВЫМ сообщением в чат (не
-        строкой в статус-сообщение), что платёж найден в истории."""
+        строкой в статус-сообщение), что платёж найден в истории.
+        history_page/known_history_ts/history_lock — если этот штраф проверяют
+        НЕСКОЛЬКО вкладок параллельно (несколько карт на один штраф), их нужно
+        передать ОБЩИМИ на все вызовы (готовит run_fine_payment) — иначе каждая
+        вкладка по отдельности увидела бы один и тот же новый платёж (от той
+        карты, что реально прошла) и обе засчитали бы его себе как успех,
+        хотя платёж был один. Если не переданы — метод сам заводит вкладку и
+        снимок "до" (для одиночного вызова этого достаточно)."""
         SHORT_STATUS = {
             "success": "✅",
             "processing": "✅",  # банк принял платёж — считаем успехом, не часиками
@@ -1033,16 +1041,22 @@ class GosuslugiBrowserClient:
             total_cards = len(card_pool)
 
         # "История платежей" — независимая от формы оплаты проверка (см.
-        # докстринг). Открываем отдельную вкладку один раз на весь штраф и
+        # докстринг). Если вызывающий код (несколько параллельных вкладок
+        # одного штрафа) уже передал общую вкладку/снимок/лок — используем их;
+        # иначе (одиночный вызов) заводим свои: открываем вкладку один раз и
         # запоминаем, что там уже было ДО первой попытки — иначе штраф,
         # оплаченный когда-то раньше с той же суммой, спутался бы с только
         # что прошедшим платежом.
-        history_page = None
-        known_history_ts = set()
-        if uin and amount_str:
+        owns_history_tab = False
+        if known_history_ts is None:
+            known_history_ts = set()
+        if history_lock is None:
+            history_lock = asyncio.Lock()
+        if uin and amount_str and history_page is None:
             try:
                 history_page = await acquire_tab(self)
                 known_history_ts = await self.known_history_timestamps(history_page, uin, amount_str)
+                owns_history_tab = True
             except Exception as e:
                 logger.warning("Не удалось подготовить проверку истории платежей: %s", e)
                 history_page = None
@@ -1106,9 +1120,20 @@ class GosuslugiBrowserClient:
                 # случай сверяемся с "Историей платежей" прежде чем сдаваться.
                 if history_page and status not in ("success", "processing"):
                     try:
-                        found, found_ts, _ = await self.check_payment_in_history(
-                            history_page, uin, amount_str, exclude_timestamps=known_history_ts
-                        )
+                        # Лок — на случай нескольких вкладок ОДНОГО штрафа:
+                        # без него обе могли бы независимо прочитать одну и ту
+                        # же новую запись в истории и обе засчитать её себе.
+                        # "Забираем" найденную запись (добавляем в общий
+                        # known_history_ts) СРАЗУ под тем же локом — до await
+                        # между проверкой и "захватом" нет, поэтому соседняя
+                        # вкладка, дождавшись лока следующей, эту запись уже
+                        # не увидит и не припишет себе повторно.
+                        async with history_lock:
+                            found, found_ts, _ = await self.check_payment_in_history(
+                                history_page, uin, amount_str, exclude_timestamps=known_history_ts
+                            )
+                            if found:
+                                known_history_ts.add(found_ts)
                     except Exception as e:
                         logger.warning("Ошибка проверки истории платежей: %s", e)
                         found = False
@@ -1131,7 +1156,10 @@ class GosuslugiBrowserClient:
                     # пробовать не нужно (это не отказ).
                     return True
         finally:
-            if history_page:
+            # Общую (переданную извне) вкладку истории не закрываем сами —
+            # ею распоряжается run_fine_payment, который её и открыл на весь
+            # штраф целиком, а не на один этот вызов.
+            if history_page and owns_history_tab:
                 release_tab(self, history_page)
 
     async def close(self):
@@ -1282,6 +1310,26 @@ async def run_fine_payment(client, batch, fine, chat_id):
     fine["running"] = True
     resume = fine["attempted"]  # это уже не первый заход на этот штраф —
     fine["attempted"] = True    # страница осталась на экране предыдущего результата
+
+    # Проверка "Истории платежей" — ОДНА общая на весь штраф (вкладка, снимок
+    # "до" и лок), а не своя у каждой карточной вкладки. У штрафа один и тот
+    # же УИН+сумма на всех параллельных вкладках — если бы каждая вкладка
+    # сама открывала историю и сверялась независимо, они обе увидели бы ОДИН
+    # и тот же новый платёж (от той карты, которая реально прошла) и обе
+    # засчитали бы его себе как успех, хотя платёж был один. known_history_ts
+    # общий и мутируется под locком: как только одна вкладка "забрала" себе
+    # найденную запись, другая её уже не увидит и не припишет себе повторно.
+    history_page = None
+    known_history_ts = set()
+    history_lock = asyncio.Lock()
+    if fine["uin"] and fine["amount_str"]:
+        try:
+            history_page = await acquire_tab(client)
+            known_history_ts = await client.known_history_timestamps(history_page, fine["uin"], fine["amount_str"])
+        except Exception as e:
+            logger.warning("Не удалось подготовить проверку истории платежей для штрафа: %s", e)
+            history_page = None
+
     try:
         async def set_progress(current, total):
             await fine["status_msg"].set_title(f"{fine['base_title']} {current}/{total}")
@@ -1292,7 +1340,8 @@ async def run_fine_payment(client, batch, fine, chat_id):
                 is_fssp=fine["is_fssp"], amount_str=fine["amount_str"],
                 total_cards=batch["total_cards"], set_progress_fn=set_progress,
                 payment_url=payment_url, resume=resume, uin=fine["uin"],
-                chat_id=chat_id,
+                chat_id=chat_id, history_page=history_page,
+                known_history_ts=known_history_ts, history_lock=history_lock,
             )
 
         results = await asyncio.gather(
@@ -1305,6 +1354,8 @@ async def run_fine_payment(client, batch, fine, chat_id):
             for p in fine["pages"]:
                 release_tab(client, p)
     finally:
+        if history_page:
+            release_tab(client, history_page)
         fine["running"] = False
 
 
