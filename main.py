@@ -747,18 +747,25 @@ class GosuslugiBrowserClient:
 
         outcome = None
         for _ in range(8):  # опрашиваем ~40 секунд — банк может отвечать не сразу
-            # СНАЧАЛА проверяем однозначные текстовые статусы на самой странице
-            # Госуслуг (отказ/успех/обработка) — они надёжнее эвристики "домен
-            # похож на банк" ниже. Та эвристика однажды ложно сработала на уже
-            # неактуальном/скрытом iframe от прошлого шага 3DS, из-за чего бот
-            # пытался отменить платёж, который на самом деле просто "в обработке".
+            # СНАЧАЛА проверяем однозначные текстовые статусы (отказ/успех/
+            # обработка) — они надёжнее эвристики "домен похож на банк" ниже.
+            # ВАЖНО: ищем по ВСЕМ фреймам страницы, а не только на самой
+            # верхней — форма оплаты (и, судя по всему, итоговый статус тоже)
+            # может рисоваться внутри iframe, куда вводилась карта, а не
+            # всплывать в главный документ. Раньше искали только на page,
+            # из-за чего реальный успех/отказ внутри iframe не находился
+            # вообще, и бот 40 секунд впустую ждал текста, которого никогда
+            # не увидит на верхнем уровне.
             try:
-                if await page.locator(declined_selector).count() > 0:
-                    outcome = "declined"
-                elif await page.locator(success_selector).count() > 0:
-                    outcome = "success"
-                elif await page.locator(processing_selector).count() > 0:
-                    outcome = "processing"
+                for frame in page.frames:
+                    if await frame.locator(declined_selector).count() > 0:
+                        outcome = "declined"
+                    elif await frame.locator(success_selector).count() > 0:
+                        outcome = "success"
+                    elif await frame.locator(processing_selector).count() > 0:
+                        outcome = "processing"
+                    if outcome:
+                        break
             except Exception:
                 pass
 
@@ -1294,8 +1301,15 @@ async def addcards_cb(callback: CallbackQuery):
 async def process_steps(message: Message):
     chat_id = message.chat.id
     # Регистрируем текущую задачу, чтобы /stop мог её отменить, даже если
-    # это долгий поиск/оплата на нескольких вкладках.
-    active_tasks[chat_id] = asyncio.current_task()
+    # это долгий поиск/оплата на нескольких вкладках. НЕ перезаписываем, если
+    # для этого чата уже отслеживается ещё не завершённая задача — иначе
+    # случайное лишнее сообщение (пришло не туда, задублировали карты и т.п.)
+    # подменит собой отслеживаемую задачу на своё, которое почти сразу
+    # завершится — и /stop после этого перестанет видеть реально идущую
+    # оплату, решив, что активных процессов нет.
+    existing_task = active_tasks.get(chat_id)
+    if not existing_task or existing_task.done():
+        active_tasks[chat_id] = asyncio.current_task()
     state = user_state.get(chat_id)
     client = shared_client
 
