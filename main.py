@@ -144,11 +144,6 @@ class GosuslugiBrowserClient:
                     return "logged_in"
             except Exception:
                 pass
-            # Госуслуги иногда вешают поверх сайта баннер-заставку (например,
-            # про выборы), и пока он висит, само приложение не грузится и на
-            # логин не уводит. Раз в несколько секунд пробуем его закрыть.
-            if waited % 5 == 4:
-                await self._dismiss_overlay(page)
             await asyncio.sleep(1)
             waited += 1
 
@@ -168,32 +163,6 @@ class GosuslugiBrowserClient:
         except Exception:
             pass
         return "blank"
-
-    # Кнопки, которыми обычно закрывают баннер/заставку поверх сайта.
-    OVERLAY_CLOSE_SELECTOR = (
-        "button:has-text('Закрыть'), button:has-text('Понятно'), button:has-text('Позже'), "
-        "button:has-text('Пропустить'), button:has-text('Не сейчас'), button:has-text('Продолжить'), "
-        "button:has-text('Перейти на Госуслуги'), a:has-text('Перейти на Госуслуги'), "
-        "a:has-text('Перейти на портал'), button:has-text('Перейти на портал'), "
-        "button[aria-label*='закры' i], button[aria-label*='close' i], "
-        "[class*='close' i][role='button'], button[class*='close' i]"
-    )
-
-    async def _dismiss_overlay(self, page):
-        """Пробует закрыть баннер/заставку поверх сайта (см. OVERLAY_CLOSE_SELECTOR)
-        на странице и во всех её фреймах. Возвращает True, если что-то нажал."""
-        for frame in page.frames:
-            try:
-                btn = frame.locator(self.OVERLAY_CLOSE_SELECTOR).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    text = (await btn.inner_text()).strip()[:40]
-                    await btn.click()
-                    logger.info("Закрыл баннер поверх сайта: кнопка «%s» (фрейм %s)", text, frame.url[:80])
-                    await asyncio.sleep(2)
-                    return True
-            except Exception:
-                continue
-        return False
 
     async def _log_clickables(self, page):
         """Пишет в лог видимые кнопки/ссылки на странице и во фреймах — чтобы
@@ -242,30 +211,24 @@ class GosuslugiBrowserClient:
         try:
             await self._launch_browser()
 
-            # Сначала — на защищённую страницу: если сессия ещё жива, вводить
-            # логин/пароль не нужно; если нет — она сама унесёт на esia/login.
-            await self.page.goto(QUITTANCE_URL, wait_until="load")
-            state = await self._detect_session_state(self.page)
-
-            if state == "logged_in":
-                self.logged_in = True
-                return "already_logged_in", "✨ Сессия активна! Можно сразу проверять штраф через /pay."
-
-            if state == "blank":
-                # Защищённая страница пустая — но входить всё равно надо.
-                # Идём на страницу входа напрямую: она отдельный сайт (esia) и
-                # может работать, даже если сама страница квитанций не грузится.
-                logger.warning("Страница квитанций пустая — иду на страницу входа напрямую: %s", ESIA_LOGIN_URL)
-                await self.page.goto(ESIA_LOGIN_URL, wait_until="load")
-                try:
-                    await self.page.wait_for_selector(
-                        "input#login, input[type='text'], input[type='password']",
-                        state="visible", timeout=30000,
-                    )
-                except PlaywrightTimeoutError:
-                    await self._dump_error_state("login_blank")
-                    await self.close()
-                    return False, self.BLANK_PAGE_MSG.format(secs=45) + " Страница входа тоже не открылась."
+            # /login идёт СРАЗУ на страницу входа (esia), а не через страницу
+            # квитанций: та может быть накрыта баннером-заставкой Госуслуг и
+            # не грузиться вовсе, а esia — отдельный сайт, ему это не мешает.
+            await self.page.goto(ESIA_LOGIN_URL, wait_until="load")
+            try:
+                await self.page.wait_for_selector(
+                    "input#login, input[type='text'], input[type='password']",
+                    state="visible", timeout=30000,
+                )
+            except PlaywrightTimeoutError:
+                # Формы входа нет. Если при этом esia увела с /login (в личный
+                # кабинет) — значит, сессия ещё жива и входить не нужно.
+                if "login" not in self.page.url and "esia" not in self.page.url:
+                    self.logged_in = True
+                    return "already_logged_in", "✨ Сессия активна! Можно сразу проверять штраф через /pay."
+                await self._dump_error_state("login_blank")
+                await self.close()
+                return False, "⚠️ Страница входа не открылась за 30 сек. Скриншот: .bot_data/error_login_blank.png"
 
             # Если в этом браузерном профиле уже кто-то входил раньше, esia
             # сразу показывает запомненного пользователя (только поле пароля,
@@ -407,19 +370,13 @@ class GosuslugiBrowserClient:
                 "input[placeholder*='УИН'], input[placeholder*='уин'], "
                 "input[type='text']"
             )
-            # Баннер-заставка поверх сайта (например, про выборы) не даёт
-            # приложению загрузиться — если поле УИН не появилось, пробуем
-            # закрыть баннер и ждём ещё раз.
-            for attempt in range(2):
-                try:
-                    await page.wait_for_selector(uin_selector, state="visible", timeout=25000)
-                    break
-                except PlaywrightTimeoutError:
-                    if attempt == 1:
-                        await self._log_clickables(page)
-                        raise
-                    logger.info("Поле УИН не появилось — пробую закрыть баннер поверх сайта")
-                    await self._dismiss_overlay(page)
+            try:
+                await page.wait_for_selector(uin_selector, state="visible", timeout=25000)
+            except PlaywrightTimeoutError:
+                # В лог — что за кнопки видны на странице (баннер/заставка?),
+                # чтобы разбирать по логу, а не вслепую.
+                await self._log_clickables(page)
+                raise
             uin_input = page.locator(uin_selector).first
 
             await uin_input.click()
