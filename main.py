@@ -146,6 +146,11 @@ class GosuslugiBrowserClient:
             # (той же, куда падает /pay), которая честно редиректит на esia,
             # если сессии нет.
             await self.page.goto(QUITTANCE_URL, wait_until="load")
+            # ВАЖНО: сайт иногда редиректит на esia/login с задержкой — фиксированных
+            # 2с не всегда хватает, чтобы редирект успел произойти, и бот ошибочно
+            # решал, что сессия ещё активна, даже не пытаясь ввести логин/пароль,
+            # которые пользователь только что набрал (см. тот же фикс в ensure_logged_in).
+            await self._wait_for_page_content(self.page)
             await asyncio.sleep(2)
 
             if "login" not in self.page.url and "esia" not in self.page.url:
