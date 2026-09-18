@@ -38,6 +38,12 @@ USER_PROFILE_DIR = os.path.join(BASE_DATA_DIR, "gosuslugi_profile")
 # Страница прямого поиска и оплаты штрафа/квитанции по УИН.
 QUITTANCE_URL = "https://www.gosuslugi.ru/pay/quittance"
 
+# Потолок вкладок на ОДИН штраф при нескольких картах (1 исходная + доп.).
+# Реальное число всё равно не больше присланных карт. Упирается не в
+# браузер, а в память/CPU сервера и в то, сколько параллельных поисков
+# выдержат Госуслуги — если вкладки "не открываются", снижай.
+MAX_TABS_PER_FINE = 10
+
 # Страница входа (esia) — отдельный сайт. Нужна, чтобы залогиниться напрямую,
 # если защищённая страница квитанций не отрисовалась и сама не унесла на вход.
 ESIA_LOGIN_URL = "https://esia.gosuslugi.ru/login/"
@@ -1961,12 +1967,12 @@ async def process_steps(message: Message):
             )
             pages = [page]
             # Если штраф один и карт несколько — открываем этому же штрафу ещё
-            # вкладок (до 5 всего), по числу карт, чтобы они пробовались
+            # вкладок (до MAX_TABS_PER_FINE всего), по числу карт, чтобы они пробовались
             # параллельно и оплата шла быстрее. При нескольких штрафах сразу
             # это не делаем — иначе вкладок стало бы слишком много разом.
             replica_failures = []
             if not multi and uin and len(cards) > 1:
-                wanted = min(len(cards), 5) - 1
+                wanted = min(len(cards), MAX_TABS_PER_FINE) - 1
                 replicas = await asyncio.gather(*[
                     prepare_replica_page(uin, is_fssp, amount_str, i) for i in range(wanted)
                 ])
