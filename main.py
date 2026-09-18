@@ -1928,21 +1928,27 @@ async def process_steps(message: Message):
             pending_fines = [(await acquire_tab(client), None, False, None)]
         multi = len(pending_fines) > 1
 
-        async def prepare_replica_page(uin, is_fssp, amount_str):
+        async def prepare_replica_page(uin, is_fssp, amount_str, index):
             """Открывает ЕЩЁ ОДНУ вкладку на тот же самый штраф (заново ищет
             его по УИН) — используется, чтобы несколько карт одного штрафа
-            пробовались параллельно, а не по очереди в одной вкладке."""
+            пробовались параллельно, а не по очереди в одной вкладке.
+            Возвращает (page | None, причина_неудачи | None)."""
+            # Не стартуем все поиски в одну и ту же секунду — сайт хуже
+            # переживает 4 одновременных поиска, чем 4 с небольшим разбегом.
+            await asyncio.sleep(index * 2)
             tab = await acquire_tab(client)
-            success, _, result_page, _, _ = await client.check_penalty_by_uin(uin, tab)
+            success, res_msg, result_page, _, _ = await client.check_penalty_by_uin(uin, tab)
             if not success:
                 release_tab(client, result_page or tab)
-                return None
+                logger.warning("Доп. вкладка #%d для УИН %s не открылась: %s", index + 1, uin, res_msg)
+                return None, res_msg
             if is_fssp and amount_str:
-                ok_amt, _ = await client.set_partial_payment_amount(result_page, amount_str)
+                ok_amt, amt_msg = await client.set_partial_payment_amount(result_page, amount_str)
                 if not ok_amt:
                     release_tab(client, result_page)
-                    return None
-            return result_page
+                    logger.warning("Доп. вкладка #%d для УИН %s: не удалось задать сумму: %s", index + 1, uin, amt_msg)
+                    return None, f"сумма ФССП: {amt_msg}"
+            return result_page, None
 
         # "Общая очередь карт" — этот же список карт разбирают все штрафы
         # партии, и кнопка "Добавить ещё карты" дозаписывает сюда же новые
@@ -1958,17 +1964,24 @@ async def process_steps(message: Message):
             # вкладок (до 5 всего), по числу карт, чтобы они пробовались
             # параллельно и оплата шла быстрее. При нескольких штрафах сразу
             # это не делаем — иначе вкладок стало бы слишком много разом.
+            replica_failures = []
             if not multi and uin and len(cards) > 1:
+                wanted = min(len(cards), 5) - 1
                 replicas = await asyncio.gather(*[
-                    prepare_replica_page(uin, is_fssp, amount_str)
-                    for _ in range(min(len(cards), 5) - 1)
+                    prepare_replica_page(uin, is_fssp, amount_str, i) for i in range(wanted)
                 ])
-                pages.extend(p for p in replicas if p)
+                pages.extend(p for p, _ in replicas if p)
+                replica_failures = [reason for p, reason in replicas if not p]
 
             status_msg = StatusMessage(base_title, reply_markup=ADD_CARDS_KEYBOARD)
             await status_msg.start(message)
-            if len(pages) > 1:
-                await status_msg.push(f"⚡ {len(pages)} вкладки параллельно")
+            if len(pages) > 1 or replica_failures:
+                line = f"⚡ {len(pages)} вкладки параллельно"
+                if replica_failures:
+                    # Раньше неудавшиеся вкладки отбрасывались молча, и было
+                    # непонятно, почему их меньше, чем карт.
+                    line += f" ({len(replica_failures)} не открылись: {replica_failures[0][:80]})"
+                await status_msg.push(line)
             batch["fines"].append({
                 "pages": pages, "uin": uin, "is_fssp": is_fssp, "amount_str": amount_str,
                 "status_msg": status_msg, "base_title": base_title,
