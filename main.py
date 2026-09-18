@@ -207,6 +207,68 @@ class GosuslugiBrowserClient:
             await self.close()
             return False, f"Ошибка проверки сессии: {str(e)}"
 
+    # "Зал ожидания" на входе esia: "Скоро вы сможете войти… Здесь появится
+    # ссылка для входа… Осталось 03:00". Ждём до 6 минут — с запасом к их трём.
+    LOGIN_QUEUE_MAX_WAIT = 360
+    LOGIN_QUEUE_MARKERS = ("Скоро вы сможете войти", "появится ссылка для входа", "Осталось")
+    LOGIN_LINK_SELECTOR = (
+        "a:has-text('Войти'), button:has-text('Войти'), a:has-text('войти'), "
+        "a:has-text('Перейти'), button:has-text('Перейти'), a:has-text('Продолжить'), "
+        "button:has-text('Продолжить')"
+    )
+
+    async def _wait_through_login_queue(self, page):
+        """Госуслуги перед формой входа стали показывать таймер (~3 мин), после
+        которого появляется ссылка для входа — её нужно нажать. Ждём конца
+        таймера, жмём ссылку, ждём форму. Возвращает 'form' (форма входа на
+        экране), 'already_logged_in' (esia увела с /login в кабинет — сессия
+        жива) или 'timeout'."""
+        form_selector = "input#login, input[type='text'], input[type='password']"
+        waited = 0
+        clicked_link = False
+        while waited < self.LOGIN_QUEUE_MAX_WAIT:
+            try:
+                if await page.locator(form_selector).first.is_visible():
+                    return "form"
+            except Exception:
+                pass
+            if "login" not in page.url and "esia" not in page.url:
+                return "already_logged_in"
+
+            try:
+                body_text = await page.inner_text("body")
+            except Exception:
+                body_text = ""
+            in_queue = any(marker in body_text for marker in self.LOGIN_QUEUE_MARKERS)
+
+            if in_queue:
+                if waited % 30 == 0:
+                    remaining = re.search(r"\d{1,2}\s*:\s*\d{2}", body_text)
+                    logger.info("Таймер на входе Госуслуг, осталось %s (жду уже %d сек)",
+                                remaining.group(0) if remaining else "?", waited)
+            elif not clicked_link:
+                # Таймер закончился — ищем появившуюся ссылку для входа. Сначала
+                # по ожидаемому тексту, иначе — любую видимую ссылку/кнопку,
+                # кроме переключателя языка.
+                try:
+                    link = page.locator(self.LOGIN_LINK_SELECTOR).first
+                    if not (await link.count() > 0 and await link.is_visible()):
+                        link = page.locator("a, button").filter(has_not_text="Русский").first
+                    if await link.count() > 0 and await link.is_visible():
+                        text = (await link.inner_text()).strip()[:40]
+                        await link.click()
+                        clicked_link = True
+                        logger.info("Таймер на входе прошёл — нажал ссылку для входа: «%s»", text)
+                        await asyncio.sleep(3)
+                except Exception as e:
+                    logger.info("Не удалось нажать ссылку для входа: %s", e)
+
+            await asyncio.sleep(1)
+            waited += 1
+
+        await self._log_clickables(page)
+        return "timeout"
+
     async def start_auth(self, username, password):
         try:
             await self._launch_browser()
@@ -215,20 +277,17 @@ class GosuslugiBrowserClient:
             # квитанций: та может быть накрыта баннером-заставкой Госуслуг и
             # не грузиться вовсе, а esia — отдельный сайт, ему это не мешает.
             await self.page.goto(ESIA_LOGIN_URL, wait_until="load")
-            try:
-                await self.page.wait_for_selector(
-                    "input#login, input[type='text'], input[type='password']",
-                    state="visible", timeout=30000,
-                )
-            except PlaywrightTimeoutError:
-                # Формы входа нет. Если при этом esia увела с /login (в личный
-                # кабинет) — значит, сессия ещё жива и входить не нужно.
-                if "login" not in self.page.url and "esia" not in self.page.url:
-                    self.logged_in = True
-                    return "already_logged_in", "✨ Сессия активна! Можно сразу проверять штраф через /pay."
+            outcome = await self._wait_through_login_queue(self.page)
+            if outcome == "already_logged_in":
+                self.logged_in = True
+                return "already_logged_in", "✨ Сессия активна! Можно сразу проверять штраф через /pay."
+            if outcome != "form":
                 await self._dump_error_state("login_blank")
                 await self.close()
-                return False, "⚠️ Страница входа не открылась за 30 сек. Скриншот: .bot_data/error_login_blank.png"
+                return False, (
+                    f"⚠️ Форма входа так и не появилась за {self.LOGIN_QUEUE_MAX_WAIT // 60} мин. "
+                    "Скриншот: .bot_data/error_login_blank.png"
+                )
 
             # Если в этом браузерном профиле уже кто-то входил раньше, esia
             # сразу показывает запомненного пользователя (только поле пароля,
@@ -261,8 +320,9 @@ class GosuslugiBrowserClient:
                 # не спрашивая пользователя в Telegram вообще.
                 try:
                     await asyncio.sleep(2)
-                    code = pyotp.TOTP(self.totp_secret).now()
-                    success, msg = await self.enter_sms_code(code)
+                    # Код генерируется внутри, когда поле реально появится —
+                    # до него теперь можно ждать минуты (таймер Госуслуг).
+                    success, msg = await self.enter_sms_code(totp_secret=self.totp_secret)
                     if success:
                         return "auto_logged_in", "✅ Авторизация успешна (TOTP-код введён автоматически)."
                     return False, f"❌ Автоматический ввод TOTP не сработал: {msg}"
@@ -288,7 +348,17 @@ class GosuslugiBrowserClient:
         except Exception as e:
             logger.warning("Не удалось сохранить скриншот ошибки (%s): %s", tag, e)
 
-    async def enter_sms_code(self, code):
+    # Сколько ждать поле для кода после ввода пароля. Госуслуги стали ставить
+    # таймер (~3 минуты) перед тем, как пустить дальше — 15 секунд, как было,
+    # уже не хватает.
+    CODE_FIELD_MAX_WAIT = 240
+
+    async def enter_sms_code(self, code=None, totp_secret=None):
+        """Вводит код подтверждения. Либо готовый code (СМС, который прислал
+        пользователь), либо totp_secret — тогда код генерируется ТОЛЬКО когда
+        поле для него реально появилось: TOTP живёт ~30 секунд, а до поля
+        теперь можно ждать несколько минут из-за таймера Госуслуг, и код,
+        сгенерированный заранее, к тому моменту протух бы."""
         try:
             if not self.page: return False, "Сессия не найдена. Начните сначала через /login."
             # Поле ввода кода может быть и под СМС, и под TOTP из приложения —
@@ -297,7 +367,32 @@ class GosuslugiBrowserClient:
                 "input[type='tel'], input[inputmode='numeric'], "
                 "input[autocomplete='one-time-code'], input[name*='otp' i], input[name*='code' i]"
             )
-            await self.page.wait_for_selector(code_selector, timeout=15000)
+            waited = 0
+            while True:
+                try:
+                    if await self.page.locator(code_selector).first.is_visible():
+                        break
+                except Exception:
+                    pass
+                if waited >= self.CODE_FIELD_MAX_WAIT:
+                    await self._dump_error_state("code_field")
+                    return False, (
+                        f"⏱ Поле для кода так и не появилось за {self.CODE_FIELD_MAX_WAIT // 60} мин. "
+                        "Скриншот: .bot_data/error_code_field.png"
+                    )
+                # Раз в полминуты — в лог, что сейчас на странице (таймер и т.п.),
+                # чтобы по логу было видно, чего ждём.
+                if waited % 30 == 0:
+                    try:
+                        snippet = (await self.page.inner_text("body")).strip().replace("\n", " | ")[:200]
+                    except Exception:
+                        snippet = "?"
+                    logger.info("Жду поле для кода (%d сек), на странице: %s", waited, snippet)
+                await asyncio.sleep(1)
+                waited += 1
+
+            if totp_secret:
+                code = pyotp.TOTP(totp_secret).now()
             await self.page.fill(code_selector, code)
 
             # СТАРЫЙ БАГ: страница входа сама находится на *.gosuslugi.ru
