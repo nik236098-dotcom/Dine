@@ -38,6 +38,10 @@ USER_PROFILE_DIR = os.path.join(BASE_DATA_DIR, "gosuslugi_profile")
 # Страница прямого поиска и оплаты штрафа/квитанции по УИН.
 QUITTANCE_URL = "https://www.gosuslugi.ru/pay/quittance"
 
+# Страница входа (esia) — отдельный сайт. Нужна, чтобы залогиниться напрямую,
+# если защищённая страница квитанций не отрисовалась и сама не унесла на вход.
+ESIA_LOGIN_URL = "https://esia.gosuslugi.ru/login/"
+
 # "История платежей" — надёжный источник правды об итоге оплаты: текст на
 # самой форме оплаты угадывался и то и дело подводил (дисклеймеры путались
 # с отказом, результат рисовался в iframe и вообще не находился). Здесь же
@@ -102,34 +106,88 @@ class GosuslugiBrowserClient:
         await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         self.page.set_default_timeout(40000)
 
+    # Что видно на защищённой странице (см. _detect_session_state). Отдельно
+    # от селектора поиска: там в конце есть общий input[type='text'] как
+    # запасной вариант — для ПОЛОЖИТЕЛЬНОГО признака "мы внутри" он не годится
+    # (поле логина на esia — тоже input[type='text']).
+    UIN_FIELD_SELECTOR = (
+        "input[name*='uin' i], input[id*='uin' i], "
+        "input[placeholder*='УИН'], input[placeholder*='уин']"
+    )
+    LOGIN_FORM_SELECTOR = "input#login, input#password, input[type='password']"
+
+    async def _detect_session_state(self, page, max_wait=45):
+        """Смотрит, что РЕАЛЬНО показала защищённая страница, и возвращает:
+        'logged_in'  — видно поле УИН (мы внутри, сессия живая);
+        'logged_out' — унесло на esia/login или видна форма входа;
+        'blank'      — за max_wait сек ни того, ни другого: страница пустая,
+                       не грузится или заблокирована.
+        Раньше признаком живой сессии было "не унесло на логин" — и пустая,
+        так и не загрузившаяся страница сходила за "Сессия активна", хотя
+        сессии не было вовсе. Теперь сессия считается живой только по
+        положительному признаку."""
+        waited = 0
+        while waited < max_wait:
+            url = page.url
+            if "login" in url or "esia" in url:
+                return "logged_out"
+            try:
+                if await page.locator(self.LOGIN_FORM_SELECTOR).first.is_visible():
+                    return "logged_out"
+                if await page.locator(self.UIN_FIELD_SELECTOR).first.is_visible():
+                    return "logged_in"
+                # На странице поиска квитанций слово "УИН" есть в подписи к
+                # полю — тоже годится как признак, что страница наша и
+                # отрисовалась, даже если атрибуты самого поля другие.
+                body_text = await page.inner_text("body")
+                if "УИН" in body_text and len(body_text.strip()) >= 50:
+                    return "logged_in"
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            waited += 1
+
+        # Диагностика пустой страницы — чтобы понять, что именно сайт показал
+        # (ничего / капчу / "подождите" / ошибку), а не гадать.
+        try:
+            body_text = await page.inner_text("body")
+        except Exception:
+            body_text = ""
+        logger.warning(
+            "Защищённая страница не отрисовалась за %d сек: url=%s, текст (%d симв.): %s",
+            max_wait, page.url, len(body_text), body_text[:300],
+        )
+        try:
+            await page.screenshot(path=os.path.join(BASE_DATA_DIR, "blank_page.png"))
+        except Exception:
+            pass
+        return "blank"
+
+    BLANK_PAGE_MSG = (
+        "⚠️ Страница Госуслуг не загрузилась (пустая {secs} сек) — на логин не "
+        "перекинуло, но и содержимого нет. Возможно, сайт не отвечает или блокирует "
+        "этот сервер. Скриншот: .bot_data/blank_page.png. Загляни через VNC, что на экране."
+    )
+
     async def ensure_logged_in(self):
         """Проверяет, действует ли уже сохранённая сессия Госуслуг, не запрашивая
         логин/пароль заново. Используется в /pay, чтобы не гонять пользователя
         через /login при каждом перезапуске бота, если сессия ещё жива."""
         try:
             await self._launch_browser()
-            # ВАЖНО: раньше проверка ходила на публичную главную gosuslugi.ru —
-            # она не требует входа и не редиректит анонимного пользователя на
-            # логин, поэтому почти всегда выглядела как "сессия активна", даже
-            # если сессия реально истекла. Проверяем на защищённой странице
-            # (той же, куда падает /pay), которая честно редиректит на esia,
-            # если сессии нет.
+            # Проверяем на защищённой странице (той же, куда падает /pay):
+            # публичная главная gosuslugi.ru не требует входа и не редиректит,
+            # поэтому по ней сессия всегда выглядела бы живой.
             await self.page.goto(QUITTANCE_URL, wait_until="load")
-            # ВАЖНО: сайт иногда редиректит на esia/login с задержкой (это уже
-            # учтено в поиске штрафа) — фиксированных 2с не всегда хватает,
-            # чтобы редирект успел произойти, и бот ошибочно решал, что сессия
-            # жива. Ждём реального контента (до 60с), а не по таймеру, и
-            # проверяем URL уже после этого.
-            await self._wait_for_page_content(self.page)
-            # На случай, если редирект чуть отстаёт даже от появления контента —
-            # даём ещё небольшой запас и проверяем URL ещё раз.
-            await asyncio.sleep(2)
+            state = await self._detect_session_state(self.page)
 
-            if "login" not in self.page.url and "esia" not in self.page.url:
+            if state == "logged_in":
                 self.logged_in = True
                 return "already_logged_in", "✨ Сессия активна! Можно проверять штраф."
 
             self.logged_in = False
+            if state == "blank":
+                return False, self.BLANK_PAGE_MSG.format(secs=45)
             return False, "❌ Сохранённая сессия не найдена или истекла."
         except Exception as e:
             await self.close()
@@ -139,23 +197,30 @@ class GosuslugiBrowserClient:
         try:
             await self._launch_browser()
 
-            # ВАЖНО: раньше проверка ходила на публичную главную gosuslugi.ru —
-            # она не требует входа и не редиректит анонимного пользователя на
-            # логин, поэтому почти всегда выглядела как "сессия активна", даже
-            # если сессия реально истекла. Проверяем на защищённой странице
-            # (той же, куда падает /pay), которая честно редиректит на esia,
-            # если сессии нет.
+            # Сначала — на защищённую страницу: если сессия ещё жива, вводить
+            # логин/пароль не нужно; если нет — она сама унесёт на esia/login.
             await self.page.goto(QUITTANCE_URL, wait_until="load")
-            # ВАЖНО: сайт иногда редиректит на esia/login с задержкой — фиксированных
-            # 2с не всегда хватает, чтобы редирект успел произойти, и бот ошибочно
-            # решал, что сессия ещё активна, даже не пытаясь ввести логин/пароль,
-            # которые пользователь только что набрал (см. тот же фикс в ensure_logged_in).
-            await self._wait_for_page_content(self.page)
-            await asyncio.sleep(2)
+            state = await self._detect_session_state(self.page)
 
-            if "login" not in self.page.url and "esia" not in self.page.url:
+            if state == "logged_in":
                 self.logged_in = True
                 return "already_logged_in", "✨ Сессия активна! Можно сразу проверять штраф через /pay."
+
+            if state == "blank":
+                # Защищённая страница пустая — но входить всё равно надо.
+                # Идём на страницу входа напрямую: она отдельный сайт (esia) и
+                # может работать, даже если сама страница квитанций не грузится.
+                logger.warning("Страница квитанций пустая — иду на страницу входа напрямую: %s", ESIA_LOGIN_URL)
+                await self.page.goto(ESIA_LOGIN_URL, wait_until="load")
+                try:
+                    await self.page.wait_for_selector(
+                        "input#login, input[type='text'], input[type='password']",
+                        state="visible", timeout=30000,
+                    )
+                except PlaywrightTimeoutError:
+                    await self._dump_error_state("login_blank")
+                    await self.close()
+                    return False, self.BLANK_PAGE_MSG.format(secs=45) + " Страница входа тоже не открылась."
 
             # Если в этом браузерном профиле уже кто-то входил раньше, esia
             # сразу показывает запомненного пользователя (только поле пароля,
