@@ -144,11 +144,16 @@ class GosuslugiBrowserClient:
                     return "logged_in"
             except Exception:
                 pass
+            # Госуслуги иногда вешают поверх сайта баннер-заставку (например,
+            # про выборы), и пока он висит, само приложение не грузится и на
+            # логин не уводит. Раз в несколько секунд пробуем его закрыть.
+            if waited % 5 == 4:
+                await self._dismiss_overlay(page)
             await asyncio.sleep(1)
             waited += 1
 
         # Диагностика пустой страницы — чтобы понять, что именно сайт показал
-        # (ничего / капчу / "подождите" / ошибку), а не гадать.
+        # (ничего / капчу / "подождите" / баннер), а не гадать.
         try:
             body_text = await page.inner_text("body")
         except Exception:
@@ -157,11 +162,51 @@ class GosuslugiBrowserClient:
             "Защищённая страница не отрисовалась за %d сек: url=%s, текст (%d симв.): %s",
             max_wait, page.url, len(body_text), body_text[:300],
         )
+        await self._log_clickables(page)
         try:
             await page.screenshot(path=os.path.join(BASE_DATA_DIR, "blank_page.png"))
         except Exception:
             pass
         return "blank"
+
+    # Кнопки, которыми обычно закрывают баннер/заставку поверх сайта.
+    OVERLAY_CLOSE_SELECTOR = (
+        "button:has-text('Закрыть'), button:has-text('Понятно'), button:has-text('Позже'), "
+        "button:has-text('Пропустить'), button:has-text('Не сейчас'), button:has-text('Продолжить'), "
+        "button:has-text('Перейти на Госуслуги'), a:has-text('Перейти на Госуслуги'), "
+        "a:has-text('Перейти на портал'), button:has-text('Перейти на портал'), "
+        "button[aria-label*='закры' i], button[aria-label*='close' i], "
+        "[class*='close' i][role='button'], button[class*='close' i]"
+    )
+
+    async def _dismiss_overlay(self, page):
+        """Пробует закрыть баннер/заставку поверх сайта (см. OVERLAY_CLOSE_SELECTOR)
+        на странице и во всех её фреймах. Возвращает True, если что-то нажал."""
+        for frame in page.frames:
+            try:
+                btn = frame.locator(self.OVERLAY_CLOSE_SELECTOR).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    text = (await btn.inner_text()).strip()[:40]
+                    await btn.click()
+                    logger.info("Закрыл баннер поверх сайта: кнопка «%s» (фрейм %s)", text, frame.url[:80])
+                    await asyncio.sleep(2)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _log_clickables(self, page):
+        """Пишет в лог видимые кнопки/ссылки на странице и во фреймах — чтобы
+        по логу было видно, какая кнопка на баннере, без VNC."""
+        for frame in page.frames:
+            try:
+                items = await frame.eval_on_selector_all(
+                    "button, a, [role='button']",
+                    "els => els.filter(e => e.offsetParent !== null).map(e => (e.innerText || e.getAttribute('aria-label') || '').trim()).filter(t => t).slice(0, 30)",
+                )
+                logger.info("Фрейм %s — кнопки/ссылки: %s", frame.url[:80], items)
+            except Exception as e:
+                logger.info("Фрейм %s — не удалось прочитать кнопки: %s", frame.url[:80], e)
 
     BLANK_PAGE_MSG = (
         "⚠️ Страница Госуслуг не загрузилась (пустая {secs} сек) — на логин не "
@@ -362,7 +407,19 @@ class GosuslugiBrowserClient:
                 "input[placeholder*='УИН'], input[placeholder*='уин'], "
                 "input[type='text']"
             )
-            await page.wait_for_selector(uin_selector, state="visible", timeout=25000)
+            # Баннер-заставка поверх сайта (например, про выборы) не даёт
+            # приложению загрузиться — если поле УИН не появилось, пробуем
+            # закрыть баннер и ждём ещё раз.
+            for attempt in range(2):
+                try:
+                    await page.wait_for_selector(uin_selector, state="visible", timeout=25000)
+                    break
+                except PlaywrightTimeoutError:
+                    if attempt == 1:
+                        await self._log_clickables(page)
+                        raise
+                    logger.info("Поле УИН не появилось — пробую закрыть баннер поверх сайта")
+                    await self._dismiss_overlay(page)
             uin_input = page.locator(uin_selector).first
 
             await uin_input.click()
