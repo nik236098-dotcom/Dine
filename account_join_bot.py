@@ -18,6 +18,11 @@ import time
 from telethon import TelegramClient, events, Button, functions, types, utils, errors
 
 
+def make_pairing_code():
+    # Four easy-to-type symbols; no visually ambiguous 0/O or 1/I.
+    return ''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(4))
+
+
 def save_json(path, data):
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
@@ -194,6 +199,8 @@ class Portal:
     def __init__(self, user, bot, root, config, pairing):
         self.user, self.bot, self.root, self.config = user, bot, root, config
         self.pairing = pairing
+        self.pairing_expires = time.monotonic() + 600
+        self.pairing_attempts = 0
         self.owner = config.get('owner')
         self.manager = None
         self.worker_task = None
@@ -287,12 +294,25 @@ class Portal:
         async with self.pair_lock:
             if self.owner is None:
                 text = '' if callback else event.raw_text.strip()
-                supplied = text.split(maxsplit=1)[1] if text.startswith('/start ') else ''
-                if not supplied or not self.pairing or not hmac.compare_digest(supplied, self.pairing):
-                    if callback:
-                        await event.answer('Бот ещё не привязан владельцем.', alert=True)
-                    elif text == '/start':
-                        await event.respond('Открой ссылку привязки из терминала своего сервера.')
+                if callback:
+                    await event.answer('Отправь код из 4 символов из PuTTY.', alert=True)
+                    return
+                if time.monotonic() >= self.pairing_expires or self.pairing_attempts >= 20:
+                    self.pairing = make_pairing_code()
+                    self.pairing_expires = time.monotonic() + 600
+                    self.pairing_attempts = 0
+                    print(f'Новый код привязки: {self.pairing} — отправь его боту.', flush=True)
+                parts = text.split(maxsplit=1)
+                supplied = (parts[1] if len(parts) == 2 and parts[0].split('@')[0] == '/start' else text).strip().upper()
+                if text == '/start':
+                    await event.respond('Отправь сюда код из 4 символов, показанный в PuTTY. Просто код, без команд и ссылок.')
+                    return
+                if not re.fullmatch(r'[A-Z0-9]{4}', supplied):
+                    await event.respond('Нужны только 4 символа из PuTTY, например K7M2. Введи свой код.')
+                    return
+                self.pairing_attempts += 1
+                if not self.pairing or not hmac.compare_digest(supplied, self.pairing):
+                    await event.respond('Код не совпал. Введи последний код из 4 символов, показанный в PuTTY.')
                     return
                 self.owner = event.sender_id
                 self.config['owner'] = self.owner
@@ -374,14 +394,14 @@ async def main():
         if not bot_me.bot or bot_me.id != int(config['token'].split(':')[0]):
             raise SystemExit('Сессия бота не соответствует токену.')
         save_json(config_path, config)
-        pairing = secrets.token_urlsafe(24) if not config.get('owner') else None
+        pairing = make_pairing_code() if not config.get('owner') else None
         portal = Portal(user, bot, root, config, pairing)
         if me:
             await portal.activate()
         bot.add_event_handler(portal.handle, events.NewMessage(incoming=True))
         bot.add_event_handler(portal.handle, events.CallbackQuery())
         if pairing:
-            print(f'Открой эту личную ссылку со своего аккаунта (никому её не передавай):\nhttps://t.me/{bot_me.username}?start={pairing}', flush=True)
+            print(f'КОД ПРИВЯЗКИ: {pairing}\nОткрой @{bot_me.username} и отправь ему эти 4 символа. Код действует 10 минут.', flush=True)
         else:
             print(f'Готово! Открой @{bot_me.username} и отправь /start.', flush=True)
         await bot.run_until_disconnected()
