@@ -38,6 +38,7 @@ class Manager:
         self.jobs_path = state_path.with_name(state_path.stem + '_jobs.json')
         self.jobs = {int(k): v for k, v in json.loads(self.jobs_path.read_text()).items()} if self.jobs_path.exists() else {}
         self.stalled = {}
+        self.retry_at = {}
         self.next_auto = 0
         self.progress_updated = {}
         self.channels = {}
@@ -123,7 +124,7 @@ class Manager:
             buttons.append(nav)
         buttons.append([self.btn('🔄 Обновить список', 'refresh')])
         buttons.append([self.btn('👤 Аккаунт', 'account')])
-        await self.show(event, '📋 Заявки на вступление\n\nВыбери канал или группу. Здесь видны каналы твоего аккаунта, где ты можешь приглашать пользователей.\n\nСтарые заявки доступны. 🟢 — включён автоприём.', buttons)
+        await self.show(event, '📋 Заявки на вступление · версия 3\n\nВыбери канал или группу. Здесь видны каналы твоего аккаунта, где ты можешь приглашать пользователей.\n\nСтарые заявки доступны. 🟢 — включён автоприём.', buttons)
 
     async def panel(self, event, key, notice=''):
         entity = await self.checked(key)
@@ -135,7 +136,7 @@ class Manager:
             buttons.insert(0, [self.btn('⏹ Остановить принятие', f'stop:{key}')])
         text = f'📣 {entity.title}\nID: {key}\n\nОжидают принятия: {count}\nАвтоприём: {"включён" if key in self.auto else "выключен"}'
         if key in self.jobs:
-            text += '\n\n⏳ Принятие всех заявок выполняется в фоне.'
+            text += '\n\n' + ('⚠️ Задание приостановлено: проверь права доступа.' if self.jobs[key].get('paused') else '⏳ Автопроход включён. Заявки принимаются без повторных нажатий.')
         if self.last_error.get(key):
             text += '\n\nПоследняя ошибка: ' + self.last_error[key]
         if notice:
@@ -189,10 +190,10 @@ class Manager:
                 self.auto.add(key)
                 self.save()
                 return await self.panel(event, key, 'Автоприём включён: старые и новые заявки будут приниматься при проверках примерно раз в 30 секунд.')
-            if key not in self.jobs:
-                self.jobs[key] = {'message': event.message_id}
-                self.save_jobs()
-                self.stalled.pop(key, None)
+            self.jobs[key] = {'message': event.message_id}
+            self.save_jobs()
+            self.stalled.pop(key, None)
+            self.retry_at.pop(key, None)
             return await self.panel(event, key, '⏳ Принятие запущено. Бот проверит остаток после каждой операции и продолжит, пока заявок не останется. При лимите Telegram дождётся разрешённого времени.')
         key = int(parts[1])
         if action in ('ask', 'autoask'):
@@ -229,11 +230,11 @@ class Manager:
                 return await self.job_status(key, '✅ Готово. Ожидающих заявок больше нет.', done=True)
             self.stalled[key] = self.stalled.get(key, 0) + 1 if after >= before else 0
             if self.stalled[key] >= 3:
-                self.last_error[key] = f'Осталось {after}. Telegram не уменьшает очередь после повторных операций. Проверь заявки и права аккаунта.'
-                self.auto.discard(key)
-                self.save()
-                return await self.job_status(key, '⚠️ ' + self.last_error[key], done=True)
-            await self.job_status(key, f'⏳ Принятие продолжается. Осталось заявок: {after}.')
+                self.retry_at[key] = time.time() + 10
+                self.last_error[key] = f'Осталось {after}. Счётчик пока не изменился. Повторю проверку через 10 секунд — нажимать кнопку не нужно.'
+                return await self.job_status(key, '⏳ ' + self.last_error[key])
+            print(f'Автопроход: было {before}, осталось {after}. Продолжаю.', flush=True)
+            await self.job_status(key, f'⏳ Принятие продолжается. Осталось заявок: {after}. Повторно нажимать кнопку не нужно.')
         except errors.FloodWaitError as error:
             self.pause_until = time.time() + error.seconds + 1
             self.last_error[key] = f'Пауза Telegram: {error.seconds} сек. Затем продолжу автоматически.'
@@ -242,11 +243,18 @@ class Manager:
             self.pause_until = time.time() + 10
             self.last_error[key] = 'Нет ответа Telegram. Через 10 секунд проверю остаток и продолжу.'
             await self.job_status(key, '⏳ ' + self.last_error[key])
-        except (errors.RPCError, ValueError) as error:
+        except (errors.ChatAdminRequiredError, errors.ChannelPrivateError, ValueError) as error:
             self.last_error[key] = str(error) if isinstance(error, ValueError) else type(error).__name__
             self.auto.discard(key)
             self.save()
-            await self.job_status(key, '⚠️ Принятие остановлено: ' + self.last_error[key] + '. Оставшиеся заявки не отклонены.', done=True)
+            if key in self.jobs:
+                self.jobs[key]['paused'] = True
+                self.save_jobs()
+            await self.job_status(key, '⚠️ Нужна проверка доступа: ' + self.last_error[key] + '. Задание сохранено. После исправления прав нажми «Принять все».')
+        except errors.RPCError as error:
+            self.retry_at[key] = time.time() + 30
+            self.last_error[key] = type(error).__name__
+            await self.job_status(key, '⏳ Telegram вернул ' + self.last_error[key] + '. Задание сохранено, повторю через 30 секунд.')
 
     async def worker(self):
         while True:
@@ -260,9 +268,21 @@ class Manager:
                 async with self.lock:
                     if key not in self.jobs and key not in self.auto:
                         continue
-                    if time.time() < self.pause_until:
+                    if self.jobs.get(key, {}).get('paused'):
                         continue
-                    await self.process_channel(key)
+                    if time.time() < max(self.pause_until, self.retry_at.get(key, 0)):
+                        continue
+                    try:
+                        await self.process_channel(key)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        # Preserve the job even when an unexpected error affects one iteration.
+                        self.retry_at[key] = time.time() + 30
+                        self.last_error[key] = type(error).__name__
+                        print('Автопроход: ошибка', type(error).__name__, '— повтор через 30 секунд.', flush=True)
+                        with contextlib.suppress(Exception):
+                            await self.job_status(key, '⚠️ Ошибка ' + self.last_error[key] + '. Задание сохранено, повтор через 30 секунд.')
 
 
 class Portal:
