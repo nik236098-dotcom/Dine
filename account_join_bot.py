@@ -5,6 +5,9 @@ Run: python account_join_bot.py. Credentials and sessions stay outside the repo.
 import asyncio
 import contextlib
 import getpass
+import io
+import hmac
+import sys
 import json
 import os
 from pathlib import Path
@@ -87,6 +90,7 @@ class Manager:
         if nav:
             buttons.append(nav)
         buttons.append([self.btn('🔄 Обновить список', 'refresh')])
+        buttons.append([self.btn('👤 Аккаунт', 'account')])
         await self.show(event, '📋 Заявки на вступление\n\nВыбери канал или группу. Здесь видны каналы твоего аккаунта, где ты можешь приглашать пользователей.\n\nСтарые заявки доступны. 🟢 — включён автоприём.', buttons)
 
     async def panel(self, event, key, notice=''):
@@ -186,22 +190,170 @@ class Manager:
                             self.save()
 
 
+class Portal:
+    def __init__(self, user, bot, root, config, pairing):
+        self.user, self.bot, self.root, self.config = user, bot, root, config
+        self.pairing = pairing
+        self.owner = config.get('owner')
+        self.manager = None
+        self.worker_task = None
+        self.login_task = None
+        self.pair_lock = asyncio.Lock()
+
+    async def activate(self):
+        me = await self.user.get_me()
+        if not me or me.bot or me.id != self.owner:
+            raise ValueError('Подключён другой аккаунт. Войди тем аккаунтом, из которого управляешь ботом.')
+        self.manager = Manager(self.user, self.bot, self.owner, self.root/f'auto_{self.owner}.json')
+        await self.manager.refresh()
+        self.worker_task = asyncio.create_task(self.manager.worker())
+
+    def buttons(self):
+        if self.manager:
+            return [[Manager.btn('📋 Мои каналы', 'refresh')], [Manager.btn('🔌 Отключить аккаунт', 'logoutask')]]
+        return [[Manager.btn('🔗 Подключить аккаунт по QR', 'connect')]]
+
+    async def account(self, event):
+        status = '🟢 Аккаунт подключён' if self.manager else '🔴 Аккаунт не подключён'
+        text = status + '\n\nПодключи свой аккаунт, чтобы принимать старые заявки. Управление доступно только тебе.'
+        await event.respond(text, buttons=self.buttons(), parse_mode=None)
+
+    async def reset_user(self):
+        if self.worker_task:
+            self.worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.worker_task
+            self.worker_task = None
+        if self.manager:
+            self.manager.auto.clear()
+            self.manager.save()
+        self.manager = None
+        # Revoke server authorization before creating a fresh local session.
+        await self.user.log_out()
+        self.user = TelegramClient(str(self.root/'account'), self.config['api_id'], self.config['api_hash'], flood_sleep_threshold=0)
+        await self.user.connect()
+
+    async def login(self):
+        qr_message = None
+        wait_task = None
+        try:
+            import qrcode
+            qr = await self.user.qr_login()
+            wait_task = asyncio.create_task(qr.wait())
+            await asyncio.sleep(0)  # Install the Telegram update handler before displaying QR.
+            buffer = io.BytesIO()
+            buffer.name = 'telegram-login.png'
+            qrcode.make(qr.url).save(buffer, format='PNG')
+            buffer.seek(0)
+            qr_message = await self.bot.send_file(self.owner, buffer,
+                caption='Открой этот QR на компьютере. На телефоне: Telegram → Настройки → Устройства → Подключить устройство.\n\nСканируй только своим аккаунтом. QR действует недолго. Это вход на твой сервер Dine.',
+                buttons=[[Manager.btn('Отмена', 'cancel_login')]])
+            try:
+                me = await wait_task
+            except errors.SessionPasswordNeededError:
+                if not sys.stdin.isatty():
+                    await self.bot.send_message(self.owner, 'Telegram требует пароль двухэтапной защиты. Останови фоновый запуск, запусти программу в терминале и повтори подключение. Пароль вводится в терминале сервера, не в чате.')
+                    return
+                await self.bot.send_message(self.owner, 'QR принят. Telegram дополнительно требует пароль двухэтапной защиты. Введи его в терминале сервера — сюда пароль не отправляй.')
+                password = await asyncio.to_thread(getpass.getpass, 'Пароль двухэтапной защиты Telegram (ввод скрыт): ')
+                try:
+                    me = await self.user.sign_in(password=password)
+                finally:
+                    password = None
+            if me.id != self.owner or me.bot:
+                await self.reset_user()
+                await self.bot.send_message(self.owner, 'QR отсканирован другим аккаунтом. Его сессия отключена. Подключи тот аккаунт, которым ты пишешь этому боту.', buttons=self.buttons())
+                return
+            await self.activate()
+            await self.bot.send_message(self.owner, '✅ Аккаунт подключён. Выбери «Мои каналы».', buttons=self.buttons())
+        except asyncio.TimeoutError:
+            await self.bot.send_message(self.owner, 'Время QR истекло. Нажми кнопку, чтобы получить новый.', buttons=self.buttons())
+        except (errors.RPCError, OSError, ValueError) as error:
+            await self.bot.send_message(self.owner, 'Подключение не завершено: ' + type(error).__name__ + '. Повтори попытку.', buttons=self.buttons())
+        finally:
+            if wait_task:
+                if not wait_task.done():
+                    wait_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await wait_task
+            if qr_message:
+                with contextlib.suppress(errors.RPCError, OSError):
+                    await qr_message.delete()
+
+    async def handle(self, event):
+        if not event.is_private:
+            return
+        callback = isinstance(event, events.CallbackQuery.Event)
+        async with self.pair_lock:
+            if self.owner is None:
+                text = '' if callback else event.raw_text.strip()
+                supplied = text.split(maxsplit=1)[1] if text.startswith('/start ') else ''
+                if not supplied or not self.pairing or not hmac.compare_digest(supplied, self.pairing):
+                    if callback:
+                        await event.answer('Бот ещё не привязан владельцем.', alert=True)
+                    elif text == '/start':
+                        await event.respond('Открой ссылку привязки из терминала своего сервера.')
+                    return
+                self.owner = event.sender_id
+                self.config['owner'] = self.owner
+                save_json(self.root/'config.json', self.config)
+                self.pairing = None
+                with contextlib.suppress(errors.RPCError):
+                    await event.delete()
+            if event.sender_id != self.owner:
+                if callback:
+                    await event.answer('Доступ только владельцу.', alert=True)
+                return
+        data = event.data.decode() if callback else ''
+        portal_actions = {'account','connect','cancel_login','logoutask','logoutyes'}
+        if self.manager and data not in portal_actions:
+            return await self.manager.handle(event)
+        if callback:
+            await event.answer()
+        try:
+            if data == 'connect':
+                if self.manager:
+                    return await self.account(event)
+                if self.login_task and not self.login_task.done():
+                    return await event.respond('Подключение уже запущено. Сканируй QR или дождись окончания срока действия.')
+                if await self.user.is_user_authorized():
+                    await self.activate()
+                    return await self.account(event)
+                self.login_task = asyncio.create_task(self.login())
+                return
+            if data == 'cancel_login':
+                if self.login_task and not self.login_task.done():
+                    self.login_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.login_task
+                return await self.account(event)
+            if data == 'logoutask':
+                return await event.respond('Отключить аккаунт от этого сервера и выключить автоприём?', buttons=[[Manager.btn('Да, отключить', 'logoutyes')],[Manager.btn('Назад', 'account')]])
+            if data == 'logoutyes':
+                if self.manager:
+                    async with self.manager.lock:
+                        await self.reset_user()
+                return await self.account(event)
+            await self.account(event)
+        except (errors.RPCError, OSError, ValueError) as error:
+            await event.respond('Не удалось выполнить действие: ' + type(error).__name__ + '. Попробуй ещё раз.', buttons=self.buttons())
+
+
 async def main():
     os.umask(0o077)
     root = Path.home() / '.local/share/dine-join-manager'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
-    # Linux lock prevents two processes from sharing the same account session.
     import fcntl
     lock_file = (root / 'process.lock').open('w')
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise SystemExit('Эта программа уже запущена. Сначала останови её вторую копию.')
+        raise SystemExit('Программа уже запущена. Останови вторую копию.')
     config_path = root / 'config.json'
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
     if not config:
-        api_id = int(input('API ID с my.telegram.org: ').strip())
+        api_id = int(input('API ID с my.telegram.org (один раз): ').strip())
         api_hash = getpass.getpass('API HASH (ввод скрыт): ').strip()
         token = getpass.getpass('Токен бота BotFather (ввод скрыт): ').strip()
         if not re.fullmatch(r'[a-fA-F0-9]{32}', api_hash) or not re.fullmatch(r'\d+:[\w-]+', token):
@@ -209,34 +361,43 @@ async def main():
         config = dict(api_id=api_id, api_hash=api_hash, token=token)
     user = TelegramClient(str(root/'account'), config['api_id'], config['api_hash'], flood_sleep_threshold=0)
     bot = TelegramClient(str(root/'bot'), config['api_id'], config['api_hash'], flood_sleep_threshold=0)
-    task = None
+    portal = None
     try:
-        await user.start(phone=lambda: input('Твой номер телефона с +кодом страны: ').strip(),
-                         code_callback=lambda: getpass.getpass('Код входа из Telegram (ввод скрыт): ').strip(),
-                         password=lambda: getpass.getpass('Пароль двухэтапной защиты: '))
+        await user.connect()
         me = await user.get_me()
-        if me.bot:
-            raise SystemExit('Нужен личный аккаунт, а не бот.')
+        if me:
+            if me.bot or config.get('owner', me.id) != me.id:
+                raise SystemExit('Аккаунт сессии не соответствует владельцу.')
+            config['owner'] = me.id
         await bot.start(bot_token=config['token'])
         bot_me = await bot.get_me()
         if not bot_me.bot or bot_me.id != int(config['token'].split(':')[0]):
             raise SystemExit('Сессия бота не соответствует токену.')
         save_json(config_path, config)
-        manager = Manager(user, bot, me.id, root/f'auto_{me.id}.json')
-        await manager.refresh()
-        bot.add_event_handler(manager.handle, events.NewMessage(incoming=True))
-        bot.add_event_handler(manager.handle, events.CallbackQuery())
-        task = asyncio.create_task(manager.worker())
-        print(f'Готово! Открой @{bot_me.username} со своего аккаунта и отправь /start.', flush=True)
+        pairing = secrets.token_urlsafe(24) if not config.get('owner') else None
+        portal = Portal(user, bot, root, config, pairing)
+        if me:
+            await portal.activate()
+        bot.add_event_handler(portal.handle, events.NewMessage(incoming=True))
+        bot.add_event_handler(portal.handle, events.CallbackQuery())
+        if pairing:
+            print(f'Открой эту личную ссылку со своего аккаунта (никому её не передавай):\nhttps://t.me/{bot_me.username}?start={pairing}', flush=True)
+        else:
+            print(f'Готово! Открой @{bot_me.username} и отправь /start.', flush=True)
         await bot.run_until_disconnected()
     finally:
-        if task:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        if portal:
+            for task in (portal.login_task, portal.worker_task):
+                if task:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            await portal.user.disconnect()
+        else:
+            await user.disconnect()
         await bot.disconnect()
-        await user.disconnect()
         lock_file.close()
+
 
 
 if __name__ == '__main__':
