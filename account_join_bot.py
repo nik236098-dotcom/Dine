@@ -35,6 +35,11 @@ class Manager:
         self.user, self.bot, self.owner = user, bot, owner
         self.state_path = state_path
         self.auto = set(json.loads(state_path.read_text()) if state_path.exists() else [])
+        self.jobs_path = state_path.with_name(state_path.stem + '_jobs.json')
+        self.jobs = {int(k): v for k, v in json.loads(self.jobs_path.read_text()).items()} if self.jobs_path.exists() else {}
+        self.stalled = {}
+        self.next_auto = 0
+        self.progress_updated = {}
         self.channels = {}
         self.confirmations = {}
         self.lock = asyncio.Lock()
@@ -43,6 +48,28 @@ class Manager:
 
     def save(self):
         save_json(self.state_path, sorted(self.auto))
+
+    def save_jobs(self):
+        save_json(self.jobs_path, self.jobs)
+
+    async def job_status(self, key, text, done=False):
+        job = self.jobs.get(key)
+        if not job:
+            return
+        if not done and text.startswith('⏳ Принятие продолжается') and time.monotonic() - self.progress_updated.get(key, 0) < 2:
+            return
+        self.progress_updated[key] = time.monotonic()
+        if done:
+            self.jobs.pop(key, None)
+            self.save_jobs()
+        try:
+            await self.bot.edit_message(self.owner, job['message'],
+                text + '\n\nОткрой канал, чтобы проверить актуальное количество заявок.',
+                buttons=[[self.btn('📣 Открыть канал', f'view:{key}')]] +
+                    ([] if done else [[self.btn('⏹ Остановить принятие', f'stop:{key}')]]),
+                parse_mode=None)
+        except (errors.RPCError, OSError, asyncio.TimeoutError):
+            pass  # A deleted UI message must not interrupt the approval job.
 
     async def refresh(self):
         channels = {}
@@ -104,17 +131,22 @@ class Manager:
         buttons = [[self.btn('✅ Принять все заявки', f'ask:{key}')],
                    [self.btn('🔴 Выключить автоприём' if key in self.auto else '🟢 Включить автоприём', f'off:{key}' if key in self.auto else f'autoask:{key}')],
                    [self.btn('🔄 Обновить', f'view:{key}'), self.btn('← Каналы', 'page:0')]]
+        if key in self.jobs:
+            buttons.insert(0, [self.btn('⏹ Остановить принятие', f'stop:{key}')])
         text = f'📣 {entity.title}\nID: {key}\n\nОжидают принятия: {count}\nАвтоприём: {"включён" if key in self.auto else "выключен"}'
+        if key in self.jobs:
+            text += '\n\n⏳ Принятие всех заявок выполняется в фоне.'
         if self.last_error.get(key):
             text += '\n\nПоследняя ошибка: ' + self.last_error[key]
         if notice:
             text += '\n\n' + notice
         await self.show(event, text, buttons)
 
-    async def approve(self, key):
+    async def approve(self, key, entity=None):
         if time.time() < self.pause_until:
             raise ValueError(f'Telegram ограничил частоту действий. Подожди {int(self.pause_until-time.time())+1} сек.')
-        entity = await self.checked(key)
+        if entity is None:
+            entity = await self.checked(key)
         await self.user(functions.messages.HideAllChatJoinRequestsRequest(peer=entity, approved=True))
         self.last_error.pop(key, None)
 
@@ -157,8 +189,11 @@ class Manager:
                 self.auto.add(key)
                 self.save()
                 return await self.panel(event, key, 'Автоприём включён: старые и новые заявки будут приниматься при проверках примерно раз в 30 секунд.')
-            await self.approve(key)
-            return await self.panel(event, key, '✅ Telegram выполнил команду принятия всех заявок. Выше — актуальный остаток.')
+            if key not in self.jobs:
+                self.jobs[key] = {'message': event.message_id}
+                self.save_jobs()
+                self.stalled.pop(key, None)
+            return await self.panel(event, key, '⏳ Принятие запущено. Бот проверит остаток после каждой операции и продолжит, пока заявок не останется. При лимите Telegram дождётся разрешённого времени.')
         key = int(parts[1])
         if action in ('ask', 'autoask'):
             entity = await self.checked(key)
@@ -169,30 +204,65 @@ class Manager:
             text = f'📣 {entity.title}\nID: {key}\nСейчас заявок: {count}\n\n'
             text += ('Включить постоянный автоприём всех старых и новых заявок?' if action == 'autoask' else 'Принять все заявки этого канала? Будут приняты все, ожидающие на момент выполнения команды.')
             return await self.show(event, text, [[self.btn('✅ Подтвердить', f'confirm:{nonce}')], [self.btn('← Назад', f'view:{key}')]])
+        if action == 'stop':
+            self.jobs.pop(key, None)
+            self.save_jobs()
+            self.auto.discard(key)
+            self.save()
+            return await self.panel(event, key, 'Принятие остановлено. Автоприём выключен.')
         if action == 'off':
             self.auto.discard(key)
             self.save()
         await self.panel(event, key)
 
+    async def process_channel(self, key):
+        try:
+            entity = await self.checked(key)
+            before = await self.count(entity)
+            if not before:
+                self.stalled.pop(key, None)
+                return await self.job_status(key, '✅ Готово. Ожидающих заявок больше нет.', done=True)
+            await self.approve(key, entity)
+            after = await self.count(entity)
+            if not after:
+                self.stalled.pop(key, None)
+                return await self.job_status(key, '✅ Готово. Ожидающих заявок больше нет.', done=True)
+            self.stalled[key] = self.stalled.get(key, 0) + 1 if after >= before else 0
+            if self.stalled[key] >= 3:
+                self.last_error[key] = f'Осталось {after}. Telegram не уменьшает очередь после повторных операций. Проверь заявки и права аккаунта.'
+                self.auto.discard(key)
+                self.save()
+                return await self.job_status(key, '⚠️ ' + self.last_error[key], done=True)
+            await self.job_status(key, f'⏳ Принятие продолжается. Осталось заявок: {after}.')
+        except errors.FloodWaitError as error:
+            self.pause_until = time.time() + error.seconds + 1
+            self.last_error[key] = f'Пауза Telegram: {error.seconds} сек. Затем продолжу автоматически.'
+            await self.job_status(key, '⏳ ' + self.last_error[key])
+        except (OSError, asyncio.TimeoutError):
+            self.pause_until = time.time() + 10
+            self.last_error[key] = 'Нет ответа Telegram. Через 10 секунд проверю остаток и продолжу.'
+            await self.job_status(key, '⏳ ' + self.last_error[key])
+        except (errors.RPCError, ValueError) as error:
+            self.last_error[key] = str(error) if isinstance(error, ValueError) else type(error).__name__
+            self.auto.discard(key)
+            self.save()
+            await self.job_status(key, '⚠️ Принятие остановлено: ' + self.last_error[key] + '. Оставшиеся заявки не отклонены.', done=True)
+
     async def worker(self):
         while True:
-            await asyncio.sleep(30)
-            for key in list(self.auto):
+            await asyncio.sleep(0.1)
+            now = time.time()
+            keys = set(self.jobs)
+            if now >= self.next_auto:
+                keys.update(self.auto)
+                self.next_auto = now + 30
+            for key in list(keys):
                 async with self.lock:
-                    if key not in self.auto or time.time() < self.pause_until:
+                    if key not in self.jobs and key not in self.auto:
                         continue
-                    try:
-                        entity = await self.checked(key)
-                        if await self.count(entity):
-                            await self.approve(key)
-                    except errors.FloodWaitError as error:
-                        self.pause_until = time.time()+error.seconds
-                        self.last_error[key] = f'Лимит Telegram: ожидание {error.seconds} сек.'
-                    except (errors.RPCError, ValueError, OSError, asyncio.TimeoutError) as error:
-                        self.last_error[key] = type(error).__name__
-                        if isinstance(error, (ValueError, errors.ChatAdminRequiredError, errors.ChannelPrivateError)):
-                            self.auto.discard(key)
-                            self.save()
+                    if time.time() < self.pause_until:
+                        continue
+                    await self.process_channel(key)
 
 
 class Portal:
@@ -234,6 +304,8 @@ class Portal:
         if self.manager:
             self.manager.auto.clear()
             self.manager.save()
+            self.manager.jobs.clear()
+            self.manager.save_jobs()
         self.manager = None
         # Revoke server authorization before creating a fresh local session.
         await self.user.log_out()
