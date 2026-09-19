@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram join manager. Install: pip install Telethon==1.45.0
+"""Telegram join manager. Install: pip install Telethon==1.45.0 'qrcode[pil]==7.4.2'
 Run: python account_join_bot.py. Credentials and sessions stay outside the repo.
 """
 import asyncio
@@ -255,7 +255,7 @@ class Portal:
                     await self.bot.send_message(self.owner, 'Telegram требует пароль двухэтапной защиты. Останови фоновый запуск, запусти программу в терминале и повтори подключение. Пароль вводится в терминале сервера, не в чате.')
                     return
                 await self.bot.send_message(self.owner, 'QR принят. Telegram дополнительно требует пароль двухэтапной защиты. Введи его в терминале сервера — сюда пароль не отправляй.')
-                password = await asyncio.to_thread(getpass.getpass, 'Пароль двухэтапной защиты Telegram (ввод скрыт): ')
+                password = await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, 'Пароль двухэтапной защиты Telegram (ввод скрыт): ')
                 try:
                     me = await self.user.sign_in(password=password)
                 finally:
