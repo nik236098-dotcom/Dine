@@ -6,6 +6,9 @@ import re
 import pyotp  # pip install pyotp — генерация TOTP-кодов из секретного ключа
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError
+from aiogram.types import ErrorEvent
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -26,6 +29,31 @@ bot_session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else None
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, session=bot_session)
 dp = Dispatcher()
+
+
+class RetryTelegramRequests(BaseRequestMiddleware):
+    """Через прокси связь с Telegram рвётся. Раньше один сорвавшийся
+    sendMessage ронял весь обработчик: пользователь не видел ответа, а
+    состояние диалога зависало на прошлом шаге (например, бот продолжал
+    ждать УИН, хотя на сайте уже ждали сумму). Теперь сетевые ошибки и
+    5xx от Telegram повторяем несколько раз, прежде чем сдаться."""
+
+    RETRIES = 4
+
+    async def __call__(self, make_request, bot_, method):
+        for attempt in range(self.RETRIES):
+            try:
+                return await make_request(bot_, method)
+            except (TelegramNetworkError, TelegramServerError) as e:
+                if attempt == self.RETRIES - 1:
+                    raise
+                delay = 2 ** attempt
+                logger.warning("Telegram %s: %s — повтор через %d с (попытка %d/%d)",
+                               type(method).__name__, e, delay, attempt + 1, self.RETRIES)
+                await asyncio.sleep(delay)
+
+
+bot.session.middleware(RetryTelegramRequests())
 
 user_state = {}
 user_data = {}
@@ -1821,9 +1849,47 @@ async def keepamount_cb(callback: CallbackQuery):
     await apply_fssp_amount(callback.message, chat_id, shared_client, amount)
 
 
+STATE_HINTS = {
+    None: "ничего не жду. Чтобы оплатить штраф, отправьте /pay, для входа — /login.",
+    "ready_for_pay": "ничего не жду. Чтобы оплатить штраф, отправьте /pay.",
+    "waiting_username": "жду логин от Госуслуг.",
+    "waiting_password": "жду пароль от Госуслуг.",
+    "waiting_code": "жду код подтверждения входа.",
+    "waiting_uin": "жду УИН штрафа (20 или 25 цифр).",
+    "waiting_fssp_amount": "жду сумму к оплате для ФССП (числом).",
+    "waiting_card_info": "жду данные карты в формате номер|дата|cvv.",
+    "waiting_more_cards": "жду ещё карты в формате номер|дата|cvv.",
+}
+
+
+def state_hint(chat_id):
+    state = user_state.get(chat_id)
+    return "Сейчас я " + STATE_HINTS.get(state, f"в состоянии {state}.")
+
+
+@dp.errors()
+async def on_error(event: ErrorEvent):
+    """Раньше исключение в обработчике просто уходило в лог, а пользователь
+    видел тишину и не понимал, на каком шаге бот. Теперь сообщаем об ошибке
+    и о том, какого ввода бот ждёт дальше."""
+    logger.exception("Необработанная ошибка в обработчике: %s", event.exception)
+    message = event.update.message or (event.update.callback_query.message if event.update.callback_query else None)
+    if message:
+        try:
+            await message.answer(
+                f"⚠️ Внутренняя ошибка: {type(event.exception).__name__}: {event.exception}\n\n"
+                + state_hint(message.chat.id)
+            )
+        except Exception:
+            logger.exception("Не удалось сообщить пользователю об ошибке")
+    return True
+
+
 @dp.message(lambda message: message.text and not message.text.startswith("/"))
 async def process_steps(message: Message):
     chat_id = message.chat.id
+    logger.info("Сообщение от chat_id=%s, состояние=%s, длина текста=%d",
+                chat_id, user_state.get(chat_id), len(message.text))
     # Регистрируем текущую задачу, чтобы /stop мог её отменить, даже если
     # это долгий поиск/оплата на нескольких вкладках. НЕ перезаписываем, если
     # для этого чата уже отслеживается ещё не завершённая задача — иначе
@@ -1865,6 +1931,13 @@ async def process_steps(message: Message):
         # входа общая на весь контекст), параллельно с остальными.
         uins = [line.strip() for line in message.text.splitlines() if line.strip()]
         if not uins or any(not u.isdigit() or len(u) not in (20, 25) for u in uins):
+            if "|" in message.text:
+                await message.answer(
+                    "❌ Это похоже на данные карты, а я сейчас жду УИН штрафа. "
+                    "Предыдущий поиск штрафа не завершился — введите УИН заново "
+                    "или отправьте /pay, чтобы начать сначала."
+                )
+                return
             await message.answer(
                 "❌ Неверный формат. Каждый УИН — 20 или 25 цифр, можно от одной до пяти строк:"
             )
@@ -1882,17 +1955,23 @@ async def process_steps(message: Message):
         # прошлых штрафов, вместо того чтобы плодить новые.
         pages = [await acquire_tab(client) for _ in uins]
 
+        # Результаты проверки НЕ отправляем прямо отсюда: сначала переводим
+        # диалог в следующее состояние, и только потом шлём сообщения. Иначе
+        # сорвавшаяся отправка в Telegram оставляла бота в "жду УИН", хотя
+        # на сайте уже ждали сумму/карту, и следующий ввод пользователя
+        # получал бессмысленное "Неверный формат УИН".
         async def check_one(index, uin, page):
             success, res_msg, result_page, is_fssp, amount_str = await client.check_penalty_by_uin(uin, page)
             prefix = f"Штраф {index}/{len(uins)} (УИН {uin}): " if len(uins) > 1 else ""
-            await message.answer(f"{prefix}{res_msg}")
             if not success:
                 release_tab(client, result_page or page)
-            return success, result_page, uin, is_fssp, amount_str
+            return success, result_page, uin, is_fssp, amount_str, f"{prefix}{res_msg}"
 
         results = await asyncio.gather(*[
             check_one(i + 1, uin, pages[i]) for i, uin in enumerate(uins)
         ])
+        result_texts = [r[5] for r in results]
+        results = [r[:5] for r in results]
 
         # Обычные штрафы идут сразу к вводу карты (сумма уже известна — нужна
         # позже для сверки с "Историей платежей"), а ФССП — сначала нужно
@@ -1908,11 +1987,15 @@ async def process_steps(message: Message):
 
         if not ready_fines and not fssp_queue:
             user_state[chat_id] = "ready_for_pay" if client and client.logged_in else "waiting_username"
+            for text in result_texts:
+                await message.answer(text)
             return
 
         user_data[chat_id]["pending_fines"] = ready_fines
         user_data[chat_id]["fssp_queue"] = fssp_queue
         user_state[chat_id] = "waiting_fssp_amount" if fssp_queue else "waiting_card_info"
+        for text in result_texts:
+            await message.answer(text)
         if fssp_queue:
             await prompt_fssp_amount(message, chat_id)
     elif state == "waiting_fssp_amount":
@@ -2029,9 +2112,36 @@ async def process_steps(message: Message):
             await asyncio.gather(*[run_fine_payment(client, batch, fine, chat_id) for fine in unresolved])
 
         user_state[chat_id] = "ready_for_pay" if client.logged_in else None
+    else:
+        # Раньше сообщение вне ожидаемого шага молча пропадало — пользователь
+        # не понимал, дошло ли оно. Отвечаем всегда. Если такой ответ приходит
+        # на УИН/сумму/карту, которые бот только что просил, — значит, работает
+        # вторая копия бота с этим же токеном и перехватывает часть сообщений.
+        await message.answer("ℹ️ " + state_hint(chat_id))
+
+
+def acquire_single_instance_lock():
+    """Две копии бота с одним токеном делят между собой входящие сообщения:
+    /pay уходит одной, УИН — другой, и диалог разваливается (одна молчит,
+    вторая отвечает «неверный формат УИН»). На одном сервере это ловим
+    файловой блокировкой; на Windows fcntl нет — там просто пропускаем."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    lock_file = open(os.path.join(BASE_DATA_DIR, "bot.lock"), "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(
+            "Бот уже запущен (другая копия main.py держит .bot_data/bot.lock). "
+            "Останови её: pkill -f main.py — и запусти снова."
+        )
+    return lock_file
 
 
 async def main():
+    _lock = acquire_single_instance_lock()
     # Бот работает через polling (getUpdates). Если у токена остался
     # webhook (его ставит любой другой хостинг/скрипт с этим же токеном),
     # Telegram отвечает "Conflict: can't use getUpdates method while
