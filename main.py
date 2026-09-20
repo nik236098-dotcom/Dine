@@ -2032,6 +2032,11 @@ async def process_steps(message: Message):
 
 
 async def main():
+    # Бот работает через polling (getUpdates). Если у токена остался
+    # webhook (его ставит любой другой хостинг/скрипт с этим же токеном),
+    # Telegram отвечает "Conflict: can't use getUpdates method while
+    # webhook is active" и бот стоит. Снимаем webhook перед стартом.
+    await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
 
