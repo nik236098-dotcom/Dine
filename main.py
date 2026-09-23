@@ -3,6 +3,10 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
+import time
 import pyotp  # pip install pyotp — генерация TOTP-кодов из секретного ключа
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -107,6 +111,60 @@ def save_totp_secret(chat_id, secret):
 totp_secrets = load_totp_secrets()  # chat_id (str) -> секрет, в памяти на весь процесс
 
 
+# Браузер открывается С ОКНОМ (headless=False): в headless-режиме Госуслуги
+# распознают автоматизацию. На сервере без графики окно рисовать негде —
+# Chromium падает с "Missing X server or $DISPLAY". Раньше это обходили
+# запуском через xvfb-run; теперь бот сам поднимает виртуальный экран Xvfb.
+_xvfb_process = None
+
+
+def ensure_display():
+    """Гарантирует, что есть DISPLAY, на котором можно открыть окно браузера.
+    Возвращает True, если окно открыть можно (уже есть DISPLAY или подняли
+    Xvfb), и False, если графики нет и Xvfb не установлен — тогда остаётся
+    только headless (см. предупреждение в логе)."""
+    global _xvfb_process
+    if not sys.platform.startswith("linux") or os.environ.get("DISPLAY"):
+        return True
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        logger.warning(
+            "Нет DISPLAY и не установлен Xvfb — браузер запускается в headless-режиме, "
+            "Госуслуги могут распознать автоматизацию. Установите: apt install -y xvfb"
+        )
+        return False
+    for num in range(99, 120):
+        if os.path.exists(f"/tmp/.X{num}-lock"):
+            continue
+        display = f":{num}"
+        proc = subprocess.Popen(
+            [xvfb, display, "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        for _ in range(30):
+            if proc.poll() is not None:
+                break
+            if os.path.exists(f"/tmp/.X11-unix/X{num}"):
+                os.environ["DISPLAY"] = display
+                _xvfb_process = proc
+                logger.info("Поднят виртуальный экран Xvfb на DISPLAY=%s", display)
+                return True
+            time.sleep(0.1)
+        if proc.poll() is None:
+            proc.kill()
+    logger.warning("Не удалось поднять Xvfb — браузер запускается в headless-режиме")
+    return False
+
+
+def _stop_xvfb():
+    if _xvfb_process and _xvfb_process.poll() is None:
+        _xvfb_process.terminate()
+
+
+import atexit
+atexit.register(_stop_xvfb)
+
+
 class GosuslugiBrowserClient:
     def __init__(self):
         self.playwright = None
@@ -123,9 +181,11 @@ class GosuslugiBrowserClient:
         повторный запуск может унаследовать уже действующую сессию Госуслуг."""
         if self.page:
             return
+        headless = not ensure_display()
         self.playwright = await async_playwright().start()
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=USER_PROFILE_DIR, headless=False,
+            user_data_dir=USER_PROFILE_DIR, headless=headless,
+            env=dict(os.environ),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
