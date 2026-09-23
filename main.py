@@ -124,8 +124,16 @@ def ensure_display():
     Xvfb), и False, если графики нет и Xvfb не установлен — тогда остаётся
     только headless (см. предупреждение в логе)."""
     global _xvfb_process
-    if not sys.platform.startswith("linux") or os.environ.get("DISPLAY"):
+    if not sys.platform.startswith("linux"):
         return True
+    display = os.environ.get("DISPLAY")
+    if display:
+        # DISPLAY может быть прописан в профиле оболочки, хотя X-сервера
+        # давно нет — тогда Chromium всё равно упадёт. Проверяем сокет.
+        match = re.fullmatch(r":(\d+)(?:\.\d+)?", display)
+        if not match or os.path.exists(f"/tmp/.X11-unix/X{match.group(1)}"):
+            return True
+        logger.warning("DISPLAY=%s задан, но X-сервера на нём нет — подниму Xvfb", display)
     xvfb = shutil.which("Xvfb")
     if not xvfb:
         logger.warning(
@@ -182,9 +190,10 @@ class GosuslugiBrowserClient:
         if self.page:
             return
         headless = not ensure_display()
+        logger.info("Запуск браузера: headless=%s, DISPLAY=%s", headless, os.environ.get("DISPLAY"))
         self.playwright = await async_playwright().start()
-        self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=USER_PROFILE_DIR, headless=headless,
+        launch_kwargs = dict(
+            user_data_dir=USER_PROFILE_DIR,
             env=dict(os.environ),
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -196,6 +205,20 @@ class GosuslugiBrowserClient:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             locale="ru-RU", timezone_id="Europe/Moscow"
         )
+        try:
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                headless=headless, **launch_kwargs
+            )
+        except Exception as e:
+            if headless or "XServer" not in str(e) and "X server" not in str(e):
+                raise
+            # Окно открыть не вышло (нет X-сервера) — лучше headless, чем
+            # совсем не работать.
+            logger.warning("Браузер с окном не запустился (нет X-сервера) — пробую headless. %s",
+                           str(e).splitlines()[0])
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                headless=True, **launch_kwargs
+            )
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         self.page.set_default_timeout(40000)
